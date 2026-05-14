@@ -1,0 +1,327 @@
+"""
+LangGraph ReAct Agent  (permission-aware)
+==========================================
+Architecture:
+  AzureChatOpenAI  ──►  create_react_agent (LangGraph)  ──►  MCP tools
+                         └─ handles the entire tool-call loop internally
+
+Usage:
+  result = await run_agent(
+      message="...",
+      history=[...],
+      clients={...},
+      granted_scopes=[...],   # from HubSpot token
+      is_admin=False,
+  )
+"""
+
+import os
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
+from dotenv import load_dotenv
+
+from mcp_client import MCPClient
+from core.tools import get_langchain_tools, build_tool_scope_map, describe_scopes
+
+load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Base system prompt template
+# ---------------------------------------------------------------------------
+
+_BASE_SYSTEM_PROMPT = """You are a powerful HubSpot CRM agent with full access to HubSpot through these tools.
+
+## PRIMARY CRM TOOL: manage_crm_objects
+
+Use this tool to create or update ANY CRM object (contacts, companies, deals, tickets, etc.).
+
+**EXACT INPUT FORMATS — copy these precisely:**
+
+CREATE:
+```
+createRequest: {
+  "objects": [
+    {
+      "objectType": "companies",
+      "properties": {"name": "Acme", "domain": "acme.com"}
+    }
+  ]
+}
+confirmationStatus: "CONFIRMED"
+```
+
+CREATE CONTACT:
+```
+createRequest: {
+  "objects": [
+    {
+      "objectType": "contacts",
+      "properties": {"firstname": "Jane", "lastname": "Doe", "email": "jane@example.com"}
+    }
+  ]
+}
+confirmationStatus: "CONFIRMED"
+```
+
+UPDATE:
+```
+updateRequest: {
+  "objects": [
+    {
+      "objectType": "contacts",
+      "objectId": 12345,
+      "properties": {"jobtitle": "Manager"}
+    }
+  ]
+}
+confirmationStatus: "CONFIRMED"
+```
+
+CREATE WITH ASSOCIATION (e.g. contact linked to a company):
+```
+createRequest: {
+  "objects": [
+    {
+      "objectType": "contacts",
+      "properties": {"firstname": "Jane", "email": "jane@example.com"},
+      "associations": [
+        {"targetObjectType": "COMPANY", "targetObjectId": 456}
+      ]
+    }
+  ]
+}
+confirmationStatus: "CONFIRMED"
+```
+
+⚠️ RULES for manage_crm_objects:
+- `objectType` MUST be inside each object in the `objects` array — never at the top level.
+- `createRequest` and `updateRequest` are mutually exclusive — only send one per call.
+- Always use `confirmationStatus: "CONFIRMED"` after user approves.
+- Do NOT add an `action` field — the tool does not accept it.
+
+## OTHER TOOLS
+
+### search_crm_objects — Search/filter CRM records
+```
+objectType: "contacts"
+query: "jane"
+filterGroups: [{"filters": [{"propertyName": "email", "operator": "EQ", "value": "jane@example.com"}]}]
+properties: ["firstname", "lastname", "email"]
+```
+
+### get_crm_objects — Fetch by ID
+```
+objectType: "contacts"
+objectIds: [12345, 67890]
+properties: ["firstname", "email"]
+```
+
+### search_owners — Find owners by name/email
+```
+searchQuery: "jane"
+```
+
+### get_user_details — Current user info and permissions
+```
+include: ["USER_INFORMATION", "TOOL_INFORMATION"]
+```
+
+### get_properties — List available properties for an object type
+```
+objectType: "companies"
+```
+
+### search_properties — Find specific properties
+```
+objectType: "contacts"
+keywords: ["phone", "mobile"]
+```
+
+### tool_guidance — Get detailed usage instructions for any tool
+```
+toolNames: ["manage_crm_objects"]
+```
+
+## CONTEXT RESOURCES (auto-injected, never guess IDs)
+- hubspot://pipelines          → deal pipeline stage IDs
+- hubspot://ticket-pipelines   → ticket pipeline stage IDs
+- hubspot://owners             → owner IDs and emails
+- hubspot://contact-properties → valid contact property names
+- hubspot://deal-properties    → valid deal property names
+
+## SLASH COMMANDS
+/find_contact <email or name>
+/deal_report [stage]
+/create_contact_flow <email>
+/contact_summary <contact_id>
+/pipeline_overview
+/log_call_flow <name or email>
+/ticket_triage [priority]
+
+## RULES
+1. ALWAYS check hubspot://pipelines or hubspot://owners resource before using IDs — never guess.
+2. ALWAYS confirm with user ONCE before create, update, or delete actions. If the user already approved, proceed immediately — do NOT ask again.
+3. Present CRM data in clean formatted tables or summaries with emojis.
+4. If a tool returns a **FORMAT_ERROR**, fix the format yourself and retry immediately — do NOT ask the user for confirmation again.
+5. If a tool returns a **PERMISSION_DENIED** (🚫), STOP immediately. Do NOT retry. Tell the user clearly:
+   > ❌ I don't have permission to do that. Your HubSpot connection only has read access for this action. Please reconnect HubSpot with write permissions to create / update / delete records.
+6. When associating records, always do it right after creating the record.
+7. For timeline/history requests always use engagement_action with get_timeline.
+8. Never expose any tokens or credentials.
+9. Reference documents with @filename syntax.
+10. NEVER re-ask for confirmation if a tool call fails due to a FORMAT_ERROR — just fix and retry silently.
+11. NEVER retry after a PERMISSION_DENIED — it will always fail the same way.
+{permission_section}"""
+
+
+def _build_permission_section(
+    granted_scopes: list[str],
+    is_admin: bool,
+    available_tool_names: list[str],
+) -> str:
+    """
+    Build the permission context block injected into the system prompt.
+    """
+    scope_set = set(granted_scopes)
+    lines = []
+
+    # ── Role ──────────────────────────────────────────────────────────
+    role_label = "🔑 **Super Admin**" if is_admin else "👤 **Standard User**"
+    lines.append(f"\n## CURRENT USER PERMISSIONS\nRole: {role_label}")
+
+    # ── Which tools are accessible (derived from live token scopes) ──
+    tool_scope_map = build_tool_scope_map(granted_scopes)
+    accessible, blocked = [], []
+    for tool_name, matching_scopes in tool_scope_map.items():
+        if matching_scopes:   # non-empty = user has at least one matching scope
+            accessible.append(tool_name)
+        else:
+            blocked.append(tool_name)
+
+    if accessible:
+        lines.append("Accessible tools: " + ", ".join(f"`{t}`" for t in accessible))
+    if blocked:
+        lines.append("Blocked tools (missing scopes): " + ", ".join(f"`{t}`" for t in blocked))
+
+    # ── Permission-denial rule ────────────────────────────────────────
+    lines.append(
+        "\n## PERMISSION RULES\n"
+        "- If a tool returns `🚫 PERMISSION_DENIED`, STOP — do NOT retry.\n"
+        "  Tell the user: ❌ I don't have permission to do that. Please reconnect HubSpot with write permissions.\n"
+        "- If a tool returns `FORMAT_ERROR`, fix the format and retry silently — no user confirmation needed.\n"
+        "- If the user asks what they can or cannot do, summarise the accessible vs "
+        "blocked tools above.\n"
+        "- If the user asks to 'show my permissions' or 'what permissions do I have', "
+        "present a formatted markdown table of ALL their granted scopes (provided below) "
+        "grouped by category (CRM Objects, Engagements, CMS, Settings, Other)."
+    )
+
+    # ── Granted scopes list (for 'show permissions' intent) ───────────
+    if granted_scopes:
+        described = describe_scopes(granted_scopes)
+        scope_lines = "\n".join(f"  - `{d['scope']}` — {d['label']}" for d in described)
+        lines.append(f"\n## GRANTED SCOPES\n{scope_lines}")
+    else:
+        lines.append("\n## GRANTED SCOPES\n  ⚠️  No scopes available — HubSpot may not be connected.")
+
+    return "\n".join(lines)
+
+
+def build_system_prompt(
+    granted_scopes: list[str],
+    is_admin: bool,
+    available_tool_names: list[str],
+) -> str:
+    """Return the full system prompt with permission context injected."""
+    perm_section = _build_permission_section(granted_scopes, is_admin, available_tool_names)
+    return _BASE_SYSTEM_PROMPT.replace("{permission_section}", perm_section)
+
+
+# ---------------------------------------------------------------------------
+# LLM factory
+# ---------------------------------------------------------------------------
+
+def get_llm() -> AzureChatOpenAI:
+    return AzureChatOpenAI(
+        azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+        azure_endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key          = os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version      = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        temperature      = 1.0,
+        max_tokens       = 8000,
+    )
+
+
+# ---------------------------------------------------------------------------
+# History conversion
+# ---------------------------------------------------------------------------
+
+def _history_to_lc_messages(history: list[dict]) -> list:
+    result = []
+    for msg in history:
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "user":
+            result.append(HumanMessage(content=content))
+        elif role == "assistant":
+            result.append(AIMessage(content=content))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public agent runner
+# ---------------------------------------------------------------------------
+
+async def run_agent(
+    message: str,
+    history: list[dict],
+    clients: dict[str, MCPClient],
+    granted_scopes: list[str] | None = None,
+    is_admin: bool = False,
+) -> str:
+    """
+    Run one turn of the HubSpot agent.
+
+    Parameters
+    ----------
+    message         : The latest user message.
+    history         : Previous turns as [{role, content}].
+    clients         : Already-connected MCP clients keyed by name.
+    granted_scopes  : OAuth scopes from the stored HubSpot token.
+    is_admin        : Whether the connected user is a HubSpot super-admin.
+    """
+    scopes = granted_scopes or []
+    llm    = get_llm()
+    tools  = await get_langchain_tools(clients, granted_scopes=scopes)
+
+    system_prompt = build_system_prompt(
+        granted_scopes      = scopes,
+        is_admin            = is_admin,
+        available_tool_names= [t.name for t in tools],
+    )
+
+    agent = create_react_agent(
+        model  = llm,
+        tools  = tools,
+        prompt = SystemMessage(content=system_prompt),
+    )
+
+    lc_messages = _history_to_lc_messages(history)
+    lc_messages.append(HumanMessage(content=message))
+
+    result = await agent.ainvoke({"messages": lc_messages})
+
+    for msg in reversed(result["messages"]):
+        if isinstance(msg, AIMessage):
+            content = msg.content
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                joined = "\n".join(texts).strip()
+                if joined:
+                    return joined
+
+    return "I could not generate a response. Please try again."
