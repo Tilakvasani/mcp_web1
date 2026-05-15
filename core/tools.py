@@ -38,21 +38,12 @@ from langchain_core.tools import StructuredTool
 from mcp.types import TextContent
 
 from mcp_client import MCPClient
+from crm_logger import log
 
-
-# ---------------------------------------------------------------------------
-# Logger — outputs to console so you can see exactly what goes in/out of MCP
-# ---------------------------------------------------------------------------
-logger = logging.getLogger("mcp_tools")
-
-if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter(
-        "%(asctime)s [MCP] %(levelname)s  %(message)s",
-        datefmt="%H:%M:%S"
-    ))
-    logger.addHandler(_handler)
-    logger.setLevel(logging.DEBUG)
+# Silence the old verbose mcp_tools logger — we use crm_logger instead
+_mcp_logger = logging.getLogger("mcp_tools")
+_mcp_logger.setLevel(logging.CRITICAL)
+_mcp_logger.propagate = False
 
 
 # ---------------------------------------------------------------------------
@@ -565,13 +556,13 @@ def _wrap_mcp_tool(
     crm_write_map   = _build_crm_write_map(granted_scopes)
     has_tool_access = tool_access_map.get(tool_name, True)  # unknown tools = allowed
 
-    # Log the tool's declared input schema so we can verify parameter names
-    logger.debug("SCHEMA [%s]: %s", tool_name, json.dumps(schema, indent=2))
+    # Compact schema log — just tool name + prop count, no JSON dump
+    log("schema", f"[{tool_name}] {len(schema.get('properties', {}))} props")
 
     async def _run(**kwargs) -> str:
         # ── 1. Tool-level guard ────────────────────────────────────────
         if not has_tool_access:
-            logger.warning("PERMISSION_DENIED (tool-level): %s — no matching scopes", tool_name)
+            log("warn", f"PERMISSION_DENIED tool-level: {tool_name}")
             return (
                 f"🚫 PERMISSION_DENIED: I don't have permission to use `{tool_name}`.\n"
                 f"Your HubSpot token doesn't include any scopes for this tool category.\n"
@@ -584,10 +575,7 @@ def _wrap_mcp_tool(
             action = _infer_action(kwargs) or "perform this action"
             obj    = _infer_object_type(kwargs)
             label  = f"{action} {obj}".strip()
-            logger.warning(
-                "PERMISSION_DENIED (write-action): %s | action=%s obj=%s | needs scope: %s",
-                tool_name, action, obj, required_write
-            )
+            log("warn", f"PERMISSION_DENIED write: {tool_name} | action={action} obj={obj} | needs={required_write}")
             return (
                 f"🚫 PERMISSION_DENIED: I don't have permission to **{label}**.\n"
                 f"Required scope: `{required_write}`\n"
@@ -599,35 +587,29 @@ def _wrap_mcp_tool(
         try:
             clean = _normalize_crm_manage_payload(tool_name, kwargs)
         except Exception as exc:
-            logger.error("PAYLOAD_NORMALIZATION_ERROR for %s: %s", tool_name, exc)
+            log("error", f"payload normalize error [{tool_name}]: {exc}")
             return f"FORMAT_ERROR: Failed to normalize tool payload for `{tool_name}`: {exc}"
 
-        # ── LOG: exactly what we send ──────────────────────────────────
-        logger.info("━━━ TOOL CALL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        logger.info("  tool      : %s", tool_name)
-        logger.info("  raw kwargs: %s", json.dumps(kwargs, default=str, indent=2))
-        logger.info("  sent args : %s", json.dumps(clean,  default=str, indent=2))
+        # ── Compact tool call log ─────────────────────────────────────────
+        log("tool", f"call → {tool_name}({', '.join(k for k,v in clean.items() if v is not None)[:60]})")
 
         # ── 4. MCP call ────────────────────────────────────────────────
         try:
             result = await client.call_tool(tool_name, clean)
         except Exception as exc:
-            logger.exception("EXCEPTION during MCP call for %s", tool_name)
-            logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            log("error", f"MCP exception [{tool_name}]: {exc}")
             return f"TOOL_ERROR ({tool_name}): {exc}"
 
         if result is None:
-            logger.warning("  RESULT    : None (no result returned)")
-            logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            log("warn", f"[{tool_name}] returned None")
             return "Tool returned no result."
 
         texts = [item.text for item in result.content if isinstance(item, TextContent)]
         content_str = "\n".join(texts) if texts else ""
 
-        # ── LOG: exactly what MCP returned ────────────────────────────
-        logger.info("  isError   : %s", result.isError)
-        logger.info("  response  : %s", content_str[:500] + ("..." if len(content_str) > 500 else ""))
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        # ── Compact response log ─────────────────────────────────────────
+        status = "err" if result.isError else "ok"
+        log("tool", f"resp ← {tool_name} [{status}] {len(content_str)} chars")
 
         # ── 5. Error classification ────────────────────────────────────
         if result.isError:

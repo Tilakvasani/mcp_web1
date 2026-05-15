@@ -231,7 +231,7 @@ def _history_to_lc(history: list[dict]) -> list:
 
 def _strip_html(text: str) -> str:
     """Remove stray HTML tags from LLM response."""
-    clean = re.sub(r"<(?!!\\[)[^>]+>", "", text)
+    clean = re.sub(r"<(?!\!\[)[^>]+>", "", text)
     clean = clean.replace("&nbsp;", " ").replace("&amp;", "&")
     clean = clean.replace("&lt;", "<").replace("&gt;", ">")
     clean = clean.replace("&quot;", '"')

@@ -3,12 +3,11 @@ Multi-CRM AI Agent — FastAPI Backend  (Improved)
 =================================================
 Speed improvements over original:
   1. MCP client CONNECTION POOL — clients are created once and reused.
-     Each request no longer pays the connect + preflight cost (~0.5–2s saved).
   2. Health-check on reuse — if a cached client is stale it reconnects once.
   3. Background keepalive — a background task pings connected clients every 90s.
-  4. Streaming chunk size increased (160 chars) → fewer SSE frames, less overhead.
+  4. Streaming chunk size increased (160 chars) → fewer SSE frames.
 
-Routes (unchanged from original)
+Routes (unchanged)
 ---------------------------------
 GET  /api/status        GET  /api/permissions   POST /api/chat
 GET  /api/debug-mcp     POST /api/disconnect
@@ -29,6 +28,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+# ── logger first so suppress fires before any MCP imports ──────────────────
+from crm_logger import log, suppress_noisy_libs
+suppress_noisy_libs()
 
 from mcp_client import MCPClient
 from core.agent import run_agent, run_agent_both
@@ -71,23 +74,18 @@ _zo_pkce: dict[str, str] = {}
 # =============================================================================
 
 class _CachedClient:
-    """Wraps an MCPClient with a timestamp and healthy flag."""
     def __init__(self, client: MCPClient):
-        self.client    = client
-        self.created   = time.time()
-        self.healthy   = True
+        self.client  = client
+        self.created = time.time()
+        self.healthy = True
 
     def age(self) -> float:
         return time.time() - self.created
 
 
 class MCPPool:
-    """
-    Simple per-key connection pool (max 1 per key).
-    Keys: "hubspot" | "zoho_crm"
-    """
-    MAX_AGE = 300   # seconds — recreate after 5 min
-    PING_EVERY = 90 # seconds — keepalive interval
+    MAX_AGE    = 300
+    PING_EVERY = 90
 
     def __init__(self):
         self._pool: dict[str, _CachedClient] = {}
@@ -97,8 +95,8 @@ class MCPPool:
         async with self._lock:
             cached = self._pool.get(key)
             if cached and cached.healthy and cached.age() < self.MAX_AGE:
+                log("pool", f"{key} reused (age {cached.age():.0f}s)")
                 return cached.client
-            # Stale or missing — evict and return None so caller reconnects
             if cached:
                 try:
                     await cached.client.cleanup()
@@ -110,6 +108,7 @@ class MCPPool:
     async def put(self, key: str, client: MCPClient):
         async with self._lock:
             self._pool[key] = _CachedClient(client)
+        log("connect", f"{key} cached in pool")
 
     async def invalidate(self, key: str):
         async with self._lock:
@@ -119,6 +118,7 @@ class MCPPool:
                 except Exception:
                     pass
                 del self._pool[key]
+                log("bye", f"evicted: {key}")
 
     async def invalidate_all(self):
         async with self._lock:
@@ -128,15 +128,17 @@ class MCPPool:
                 except Exception:
                     pass
             self._pool.clear()
+        log("bye", "all pool clients evicted")
 
     async def keepalive(self):
-        """Ping all cached clients; invalidate dead ones."""
         async with self._lock:
             dead = []
             for key, cached in self._pool.items():
                 try:
                     ok, _ = await cached.client.preflight()
-                    if not ok:
+                    if ok:
+                        log("ping", f"{key} alive")
+                    else:
                         dead.append(key)
                 except Exception:
                     dead.append(key)
@@ -146,7 +148,7 @@ class MCPPool:
                 except Exception:
                     pass
                 del self._pool[key]
-                print(f"[pool] evicted stale client: {key}")
+                log("warn", f"evicted stale: {key}")
 
 
 _pool = MCPPool()
@@ -165,11 +167,12 @@ async def _keepalive_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     assert os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"), "AZURE_OPENAI_DEPLOYMENT_NAME missing in .env"
-    print("API ready → http://localhost:8000")
+    log("boot", "FastAPI ready → http://localhost:8000")
     task = asyncio.create_task(_keepalive_loop())
     yield
     task.cancel()
     await _pool.invalidate_all()
+    log("bye", "shutdown complete")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -183,56 +186,76 @@ app.add_middleware(
 )
 
 
+# ── Compact HTTP access log ──────────────────────────────────────────────────
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    t0       = time.time()
+    response = await call_next(request)
+    ms       = int((time.time() - t0) * 1000)
+    status   = response.status_code
+    kind     = "ok" if status < 400 else ("warn" if status < 500 else "error")
+    log(kind, f"{request.method} {request.url.path} {status} ({ms}ms)")
+    return response
+
+
 # =============================================================================
-# MCP client factories  (with pool)
+# MCP client factories
 # =============================================================================
 
 async def _make_hubspot_client() -> MCPClient | None:
-    # Try pool first
     cached = await _pool.get("hubspot")
     if cached:
         return cached
 
-    # Create fresh
+    log("connect", "HubSpot → connecting fresh…")
     try:
         token = hs_get_token()
     except RuntimeError:
+        log("error", "HubSpot → no valid token")
         return None
     client = MCPClient(url=HUBSPOT_MCP_URL, headers={"Authorization": f"Bearer {token}"})
-    ok, _ = await client.preflight()
+    ok, msg = await client.preflight()
     if not ok:
+        log("error", f"HubSpot preflight failed: {msg}")
         return None
     try:
         await client.connect()
         await _pool.put("hubspot", client)
+        log("ok", "HubSpot connected ✓")
         return client
-    except ConnectionError:
+    except ConnectionError as exc:
+        log("error", f"HubSpot connect error: {exc}")
         return None
 
 
 async def _make_zoho_client() -> tuple[MCPClient | None, str]:
     mcp_url = get_mcp_url()
     if not mcp_url:
+        log("warn", "Zoho MCP URL not set")
         return None, "mcp_url_missing"
     zo_ok, _ = zo_status()
     if not zo_ok:
+        log("warn", "Zoho OAuth token missing")
         return None, "oauth_missing"
 
-    # Try pool first
     cached = await _pool.get("zoho_crm")
     if cached:
         return cached, ""
 
-    # Create fresh
+    log("connect", "Zoho → connecting fresh…")
     client = MCPClient(url=mcp_url, headers={})
     ok, msg = await client.preflight()
     if not ok:
+        log("error", f"Zoho preflight failed: {msg}")
         return None, "preflight_failed"
     try:
         await client.connect()
         await _pool.put("zoho_crm", client)
+        log("ok", "Zoho connected ✓")
         return client, ""
-    except ConnectionError:
+    except ConnectionError as exc:
+        log("error", f"Zoho connect error: {exc}")
         return None, "connect_failed"
 
 
@@ -265,11 +288,18 @@ async def _run_agent_turn(message: str, history: list, agent: str) -> dict:
             clients["zoho_crm"] = zo
 
     if agent == "zoho_crm" and "zoho_crm" not in clients:
+        log("error", f"Zoho unavailable: {zo_err}")
         return {"ok": False, "error": zo_err, "detail": f"Zoho client unavailable: {zo_err}"}
     if agent == "hubspot" and "hubspot" not in clients:
+        log("error", "HubSpot unavailable")
         return {"ok": False, "error": "hubspot_unavailable", "detail": "HubSpot client unavailable"}
     if agent == "both" and not clients:
+        log("error", "No CRM clients connected")
         return {"ok": False, "error": "no_clients", "detail": "No CRM clients connected"}
+
+    crms = ", ".join(clients.keys())
+    log("ai", f"agent={agent} | crms=[{crms}] | running…")
+    t0 = time.time()
 
     try:
         if agent == "both":
@@ -282,30 +312,41 @@ async def _run_agent_turn(message: str, history: list, agent: str) -> dict:
                 message=message, history=history, clients=clients,
                 agent=agent, granted_scopes=scopes, is_admin=is_admin,
             )
+        elapsed = time.time() - t0
+        log("ok", f"agent done → {len(text or '')} chars in {elapsed:.1f}s")
         return {"ok": True, "text": text}
     except Exception as exc:
-        # Invalidate pool on error so next request gets a fresh connection
+        import traceback
+        elapsed = time.time() - t0
+        tb = traceback.format_exc().strip().splitlines()
+        # Log the last 3 lines of traceback for compact but informative output
+        for line in tb[-3:]:
+            log("error", line.strip())
+        log("error", f"agent error after {elapsed:.1f}s: {type(exc).__name__}: {exc}")
         if agent in ("hubspot", "both"):
             await _pool.invalidate("hubspot")
         if agent in ("zoho_crm", "both"):
             await _pool.invalidate("zoho_crm")
         return {"ok": False, "error": "agent_error", "detail": str(exc)}
-    # NOTE: no cleanup here — clients stay alive in the pool for reuse
 
 
 async def _stream_agent(message: str, history: list, agent: str):
+    log("stream", f"start | agent={agent} | '{message[:60]}'")
     result = await _run_agent_turn(message, history, agent)
 
     if not result["ok"]:
+        log("error", f"stream failed: {result['error']} — {result.get('detail','')}")
         yield f"data: {json.dumps({'type': 'error', 'error': result['error'], 'detail': result['detail']})}\n\n"
         return
 
     text = result["text"] or ""
-    # Larger chunks (160 chars) → fewer SSE frames → faster perceived streaming
+    chunks = 0
     for i in range(0, len(text), 160):
         yield f"data: {json.dumps({'type': 'chunk', 'text': text[i:i+160]})}\n\n"
-        await asyncio.sleep(0.003)  # slightly faster than original 0.005
+        chunks += 1
+        await asyncio.sleep(0.003)
 
+    log("stream", f"done | {chunks} chunks | {len(text)} chars")
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
@@ -315,9 +356,10 @@ async def _stream_agent(message: str, history: list, agent: str):
 
 @app.get("/api/status")
 async def api_status():
-    hs_ok,  hs_msg  = hs_status()
-    zo_ok,  zo_msg  = zo_status()
+    hs_ok, hs_msg  = hs_status()
+    zo_ok, zo_msg  = zo_status()
     mcp_ok, mcp_msg = get_mcp_status()
+    log("info", f"status → HS={'✅' if hs_ok else '○'} Zo={'✅' if zo_ok else '○'}")
     return {
         "hubspot": {"connected": hs_ok, "message": hs_msg},
         "zoho":    {"connected": zo_ok, "message": zo_msg,
@@ -331,6 +373,9 @@ async def api_chat(request: Request):
     message = body.get("message", "").strip()
     history = body.get("history", [])
     agent   = body.get("agent", "hubspot")
+
+    log("user", f"[{agent}] '{message[:80]}'")
+
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
     if agent not in ("hubspot", "zoho_crm", "both"):
@@ -346,6 +391,7 @@ async def api_chat(request: Request):
 async def api_permissions():
     scopes = get_token_scopes()
     if not scopes:
+        log("info", "permissions → not connected")
         return {"connected": False, "is_admin": False, "scopes": [], "tools": []}
     is_admin = False
     try:
@@ -356,6 +402,7 @@ async def api_permissions():
     except Exception:
         pass
     tool_scope_map = build_tool_scope_map(scopes)
+    log("ok", f"permissions → {len(scopes)} scopes | admin={is_admin}")
     return {
         "connected": True,
         "is_admin":  is_admin,
@@ -369,6 +416,7 @@ async def api_permissions():
 
 @app.get("/api/debug-mcp")
 async def api_debug_mcp(crm: str = "hubspot"):
+    log("debug", f"MCP test → crm={crm}")
     if crm == "zoho":
         mcp_url = get_mcp_url()
         if not mcp_url:
@@ -378,15 +426,18 @@ async def api_debug_mcp(crm: str = "hubspot"):
         try:
             token = hs_get_token()
         except RuntimeError as exc:
+            log("error", f"debug-mcp no token: {exc}")
             return JSONResponse({"error": str(exc)}, status_code=401)
         client = MCPClient(url=HUBSPOT_MCP_URL, headers={"Authorization": f"Bearer {token}"})
 
     ok, msg = await client.preflight()
     if not ok:
+        log("error", f"debug-mcp preflight failed: {msg}")
         return {"status": "preflight_failed", "detail": msg}
     try:
         await client.connect()
         tools = await client.list_tools()
+        log("ok", f"debug-mcp → {len(tools)} tools")
         result = {
             "status":     "ok",
             "transport":  client.transport,
@@ -396,6 +447,7 @@ async def api_debug_mcp(crm: str = "hubspot"):
         await client.cleanup()
         return result
     except ConnectionError as exc:
+        log("error", f"debug-mcp connect failed: {exc}")
         return {"status": "connect_failed", "detail": str(exc)}
 
 
@@ -410,21 +462,26 @@ async def oauth_connect():
     verifier, challenge = generate_pkce_pair()
     state = secrets.token_urlsafe(16)
     _hs_pkce[state] = verifier
+    log("oauth", "HubSpot OAuth flow started")
     return RedirectResponse(hs_build_auth_url(code_challenge=challenge, state=state))
 
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
     if error:
+        log("error", f"HubSpot OAuth: {error_description or error}")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={error_description or error}&crm=hubspot")
     verifier = _hs_pkce.pop(state, None)
     if not verifier:
+        log("error", "HubSpot OAuth state mismatch")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error=state_mismatch&crm=hubspot")
     try:
         hs_exchange(code=code, code_verifier=verifier)
+        log("ok", "HubSpot tokens exchanged ✓")
     except ValueError as exc:
+        log("error", f"HubSpot token exchange failed: {exc}")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={exc}&crm=hubspot")
-    await _pool.invalidate("hubspot")  # force fresh connection with new token
+    await _pool.invalidate("hubspot")
     return RedirectResponse(f"{STREAMLIT_URL}?oauth_ok=hubspot")
 
 
@@ -433,6 +490,7 @@ async def api_disconnect():
     if HS_TOKEN_FILE.exists():
         HS_TOKEN_FILE.unlink()
     await _pool.invalidate("hubspot")
+    log("bye", "HubSpot disconnected")
     return {"disconnected": True}
 
 
@@ -447,21 +505,26 @@ async def zoho_connect():
     verifier, challenge = zo_pkce()
     state = secrets.token_urlsafe(16)
     _zo_pkce[state] = verifier
+    log("oauth", "Zoho OAuth flow started")
     return RedirectResponse(zo_build_auth_url(code_challenge=challenge, state=state))
 
 
 @app.get("/zoho/callback")
 async def zoho_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
     if error:
+        log("error", f"Zoho OAuth: {error_description or error}")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={error_description or error}&crm=zoho")
     verifier = _zo_pkce.pop(state, None)
     if not verifier:
+        log("error", "Zoho OAuth state mismatch")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error=state_mismatch&crm=zoho")
     try:
         zo_exchange(code=code, code_verifier=verifier)
+        log("ok", "Zoho tokens exchanged ✓")
     except ValueError as exc:
+        log("error", f"Zoho token exchange failed: {exc}")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={exc}&crm=zoho")
-    await _pool.invalidate("zoho_crm")  # force fresh connection with new token
+    await _pool.invalidate("zoho_crm")
     return RedirectResponse(f"{STREAMLIT_URL}?oauth_ok=zoho")
 
 
@@ -472,9 +535,11 @@ async def zoho_save_mcp_url(request: Request):
     if not url:
         return JSONResponse({"error": "url required"}, status_code=400)
     save_mcp_url(url)
-    await _pool.invalidate("zoho_crm")  # old URL connection is now stale
+    await _pool.invalidate("zoho_crm")
+    log("info", f"Zoho MCP URL saved → {url[:60]}")
     client = MCPClient(url=url, headers={})
     ok, msg = await client.preflight()
+    log("ok" if ok else "warn", f"Zoho MCP reachable={ok}: {msg}")
     return {"saved": True, "reachable": ok, "detail": msg}
 
 
@@ -485,6 +550,7 @@ async def zoho_disconnect():
     if MCP_URL_FILE.exists():
         MCP_URL_FILE.unlink()
     await _pool.invalidate("zoho_crm")
+    log("bye", "Zoho disconnected")
     return {"disconnected": True}
 
 

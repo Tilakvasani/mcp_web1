@@ -15,6 +15,8 @@ Run both servers:
 import json
 import requests
 import streamlit as st
+from crm_logger import log, suppress_noisy_libs
+suppress_noisy_libs()
 
 BACKEND = "http://localhost:8000"
 
@@ -138,6 +140,7 @@ def api_stream_chat(message: str, history: list, agent: str):
                                 elif t == "error":
                                     err    = data.get("error", "")
                                     detail = data.get("detail", "")
+                                    log("error", f"stream error from backend: {err} — {detail}", source="frontend")
                                     yield _fmt_error(err, detail, agent)
                                     return
                                 elif t == "done":
@@ -190,6 +193,7 @@ def _sidebar(status: dict):
                 active = st.session_state.active_agent == ag
                 if st.button(lbl, key=f"ag_{ag}", use_container_width=True,
                               type="primary" if active else "secondary"):
+                    log("info", f"agent switched → {ag}", source="frontend")
                     st.session_state.active_agent = ag
                     st.session_state.messages     = []
                     st.rerun()
@@ -273,6 +277,7 @@ def _sidebar(status: dict):
         st.markdown(f"**Quick · {cfg['icon']} {cfg['label']}**")
         for label, prompt in cfg["quick_cmds"]:
             if st.button(label, key=f"qcmd_{label}", use_container_width=True):
+                log("info", f"quick cmd → {label}", source="frontend")
                 st.session_state.prefill    = prompt
                 st.session_state.active_tab = "chat"
                 st.rerun()
@@ -352,6 +357,7 @@ def _send(text: str):
     agent = st.session_state.active_agent
     cfg   = AGENTS[agent]
 
+    log("user", f"[{agent}] '{text[:80]}'", source="frontend")
     st.session_state.messages.append({"role": "user", "content": text, "agent": agent})
     with st.chat_message("user", avatar="👤"):
         st.markdown(text)
@@ -361,9 +367,13 @@ def _send(text: str):
         for m in st.session_state.messages[:-1]
     ]
 
+    import time as _time
+    _t0 = _time.time()
     with st.chat_message("assistant", avatar=cfg["icon"]):
         # st.write_stream handles live token-by-token display natively
         full = st.write_stream(api_stream_chat(text, history, agent))
+    _elapsed = _time.time() - _t0
+    log("ai", f"[{agent}] response → {len(full or '')} chars in {_elapsed:.1f}s", source="frontend")
 
     st.session_state.messages.append({
         "role": "assistant",
