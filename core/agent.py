@@ -137,8 +137,17 @@ _ZOHO_SYSTEM = """You are a powerful Zoho CRM AI assistant with full access to a
 ### Business Operations
 - `convertLead` — Convert lead → Contact + Account + Deal
 - `getDealsRecords` — All deals (filter by Stage, Owner, etc.)
+  ALWAYS pass query_params with fields: `{"fields": "id,Last_Name,First_Name,Email,Phone,Stage"}`
 - `getLeadsRecords` — All leads
+  ALWAYS pass query_params with fields: `{"fields": "id,First_Name,Last_Name,Email,Phone,Lead_Status"}`
 - `getAccountsRecords` — All accounts
+  ALWAYS pass query_params with fields: `{"fields": "id,Account_Name,Phone,Website,Industry"}`
+
+## ⚠️ CRITICAL: `fields` IS ALWAYS REQUIRED
+ALL get*Records tools (getLeadsRecords, getContactsRecords, getAccountsRecords, getDealsRecords, etc.)
+require `query_params` with a `fields` key. NEVER call them with `query_params: null`.
+Minimum safe value: `{"fields": "id,Last_Name,First_Name,Email,Phone"}`
+If you omit `fields` you will get REQUIRED_PARAM_MISSING error — do NOT retry without fields.
 
 ### Advanced
 - `massUpdateRecords` — Bulk update
@@ -256,7 +265,10 @@ async def run_agent(
     lc_messages = _history_to_lc(history)
     lc_messages.append(HumanMessage(content=message))
 
-    result = await react_agent.ainvoke({"messages": lc_messages})
+    result = await react_agent.ainvoke(
+        {"messages": lc_messages},
+        config={"recursion_limit": 25},  # prevent runaway tool-call loops
+    )
 
     for msg in reversed(result["messages"]):
         if isinstance(msg, AIMessage):
@@ -324,7 +336,10 @@ You can seamlessly work with either CRM system to help users manage their data, 
     lc_messages = _history_to_lc(history)
     lc_messages.append(HumanMessage(content=message))
 
-    result = await react_agent.ainvoke({"messages": lc_messages})
+    result = await react_agent.ainvoke(
+        {"messages": lc_messages},
+        config={"recursion_limit": 25},  # prevent runaway tool-call loops
+    )
 
     for msg in reversed(result["messages"]):
         if isinstance(msg, AIMessage):
