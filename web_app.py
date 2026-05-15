@@ -77,32 +77,62 @@ class _CachedClient:
     def __init__(self, client: MCPClient):
         self.client  = client
         self.created = time.time()
-        self.healthy = True
 
     def age(self) -> float:
         return time.time() - self.created
 
 
 class MCPPool:
-    MAX_AGE    = 300
-    PING_EVERY = 90
+    MAX_AGE    = 600   # raised from 300 — keep connections alive longer
+    PING_EVERY = 120   # raised from 90  — less frequent background pings
 
     def __init__(self):
         self._pool: dict[str, _CachedClient] = {}
         self._lock = asyncio.Lock()
 
     async def get(self, key: str) -> MCPClient | None:
+        """
+        Return a cached client only after confirming it is still alive.
+
+        Root cause of ClosedResourceError:
+          The old code checked `cached.healthy` (always True) and returned the
+          client without touching the actual connection. If the server closed
+          the stream between requests the client object still existed but the
+          underlying anyio MemoryObjectSendStream was closed, so the very next
+          send raised ClosedResourceError.
+
+        Fix: do a lightweight list_tools() probe (1 round-trip) before handing
+        the client out. If it raises anything, evict and return None so the
+        caller creates a fresh connection.
+        """
         async with self._lock:
             cached = self._pool.get(key)
-            if cached and cached.healthy and cached.age() < self.MAX_AGE:
-                log("pool", f"{key} reused (age {cached.age():.0f}s)")
-                return cached.client
-            if cached:
+            if not cached:
+                return None
+            if cached.age() >= self.MAX_AGE:
+                log("pool", f"{key} expired (age {cached.age():.0f}s) — evicting")
                 try:
                     await cached.client.cleanup()
                 except Exception:
                     pass
                 del self._pool[key]
+                return None
+            # Snapshot the client reference before releasing the lock for the probe
+            client = cached.client
+
+        # ── Liveness probe outside the lock so other requests aren't blocked ──
+        try:
+            await client.list_tools()          # cheapest real MCP round-trip
+            log("pool", f"{key} reused (age {cached.age():.0f}s)")
+            return client
+        except Exception as exc:
+            log("warn", f"{key} stale ({type(exc).__name__}) — evicting")
+            async with self._lock:
+                self._pool.pop(key, None)
+            try:
+                await client.cleanup()
+            except Exception:
+                pass
             return None
 
     async def put(self, key: str, client: MCPClient):
@@ -112,42 +142,52 @@ class MCPPool:
 
     async def invalidate(self, key: str):
         async with self._lock:
-            if key in self._pool:
-                try:
-                    await self._pool[key].client.cleanup()
-                except Exception:
-                    pass
-                del self._pool[key]
-                log("bye", f"evicted: {key}")
+            cached = self._pool.pop(key, None)
+        if cached:
+            try:
+                await cached.client.cleanup()
+            except Exception:
+                pass
+            log("bye", f"evicted: {key}")
 
     async def invalidate_all(self):
         async with self._lock:
-            for c in self._pool.values():
-                try:
-                    await c.client.cleanup()
-                except Exception:
-                    pass
+            snapshot = dict(self._pool)
             self._pool.clear()
+        for c in snapshot.values():
+            try:
+                await c.client.cleanup()
+            except Exception:
+                pass
         log("bye", "all pool clients evicted")
 
     async def keepalive(self):
+        """
+        Ping each cached client outside the lock so live requests are never
+        blocked. Old code held the lock for the entire HTTP round-trip.
+        """
         async with self._lock:
-            dead = []
-            for key, cached in self._pool.items():
-                try:
-                    ok, _ = await cached.client.preflight()
-                    if ok:
-                        log("ping", f"{key} alive")
-                    else:
-                        dead.append(key)
-                except Exception:
+            snapshot = dict(self._pool)
+
+        dead: list[str] = []
+        for key, cached in snapshot.items():
+            try:
+                ok, _ = await cached.client.preflight()
+                if ok:
+                    log("ping", f"{key} alive")
+                else:
                     dead.append(key)
-            for key in dead:
+            except Exception:
+                dead.append(key)
+
+        for key in dead:
+            async with self._lock:
+                cached = self._pool.pop(key, None)
+            if cached:
                 try:
-                    await self._pool[key].client.cleanup()
+                    await cached.client.cleanup()
                 except Exception:
                     pass
-                del self._pool[key]
                 log("warn", f"evicted stale: {key}")
 
 
@@ -204,6 +244,11 @@ async def access_log_middleware(request: Request, call_next):
 # =============================================================================
 
 async def _make_hubspot_client() -> MCPClient | None:
+    """
+    Return a live HubSpot MCP client.
+    pool.get() now probes the connection before returning it, so if it returns
+    None the connection was stale — we reconnect fresh automatically.
+    """
     cached = await _pool.get("hubspot")
     if cached:
         return cached
@@ -230,6 +275,11 @@ async def _make_hubspot_client() -> MCPClient | None:
 
 
 async def _make_zoho_client() -> tuple[MCPClient | None, str]:
+    """
+    Return a live Zoho MCP client.
+    pool.get() probes the connection; if stale it evicts and returns None,
+    so we fall through to a fresh connect automatically.
+    """
     mcp_url = get_mcp_url()
     if not mcp_url:
         log("warn", "Zoho MCP URL not set")
