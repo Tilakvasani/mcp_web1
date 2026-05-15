@@ -1,14 +1,13 @@
 """
 Multi-Agent LangGraph System  (Fully Dynamic)
 =============================================
-Key changes vs previous version:
-  1. ZERO hardcoded tool names, module names, or field names anywhere.
-  2. All prompt sections (CRM guide, intent table, multi-CRM list) are built
-     at runtime by inspecting the actual tools returned by each MCP server.
-  3. Adding a new MCP = zero changes here. The prompt auto-adapts.
-  4. Tool-call deduplication note added to every prompt (kills infinite loops).
-  5. recursion_limit raised to 50 (was 25).
-  6. temperature lowered to 0.1 for more deterministic tool selection.
+v3 — Session-based tool cache + intent filtering
+
+Changes vs v2:
+  - All 95 tools are loaded ONCE per session (not on every message).
+  - Per message, only 6-12 relevant tools are passed to the LLM.
+  - Session ends → cache entry deleted automatically (TTL or explicit evict).
+  - Keeps all v2 improvements: demo data, confirmation rules, casual language.
 """
 
 import os
@@ -20,8 +19,12 @@ from dotenv import load_dotenv
 
 from mcp_client import MCPClient
 from core.tools import get_langchain_tools, build_tool_scope_map, describe_scopes
+from core.session_cache import SessionToolCache
 
 load_dotenv()
+
+# Global session cache — one instance for the whole app lifetime
+_session_cache = SessionToolCache()
 
 
 # =============================================================================
@@ -35,17 +38,16 @@ def get_llm() -> AzureChatOpenAI:
         azure_endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_key          = api_key,
         api_version      = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-        temperature      = 0.1,   # lowered from 0.3 — more deterministic tool selection
+        temperature      = 0.1,
         max_tokens       = 8000,
     )
 
 
 # =============================================================================
-# Dynamic prompt builders — ALL content from live tool introspection
+# Dynamic prompt builders
 # =============================================================================
 
 def _build_tool_table(tools: list) -> str:
-    """Markdown table of tool names + first-line descriptions."""
     if not tools:
         return "_No tools loaded._"
     lines = ["| Tool | Description |", "|------|-------------|"]
@@ -57,10 +59,6 @@ def _build_tool_table(tools: list) -> str:
 
 
 def _classify_tools(tools: list) -> dict[str, list[str]]:
-    """
-    Group tool names by operation type by scanning their names.
-    No hardcoded tool names — works for any MCP.
-    """
     groups: dict[str, list[str]] = {
         "read": [], "create": [], "update": [], "delete": [],
         "search": [], "convert": [], "other": [],
@@ -85,12 +83,6 @@ def _classify_tools(tools: list) -> dict[str, list[str]]:
 
 
 def _infer_modules_from_tools(tool_names: list[str]) -> list[str]:
-    """
-    Derive record module/object names from tool names by stripping verb
-    prefixes and noun suffixes. Works for any CRM naming convention.
-    e.g. getLeadsRecords -> Leads, ZohoCRM_getDealsRecords -> Deals,
-         manage_crm_objects -> (skipped), searchContactsRecords -> Contacts
-    """
     prefixes = r"^(ZohoCRM_|hs_|crm_)?(get|create|update|upsert|delete|clone|search|list|fetch|manage)"
     suffixes = r"(Records?|Items?|Objects?|Entries?)$"
     skip_words = {
@@ -111,10 +103,6 @@ def _infer_modules_from_tools(tool_names: list[str]) -> list[str]:
 
 
 def _build_intent_table(tools: list) -> str:
-    """
-    Build the intent-recognition section dynamically.
-    Example tool names in each row are real tools from the live MCP.
-    """
     groups = _classify_tools(tools)
 
     def _first(lst, n=2):
@@ -123,27 +111,22 @@ def _build_intent_table(tools: list) -> str:
     lines = [
         "**Intent → Tool mapping (auto-built from available tools)**",
         "",
-        f'- "show me", "list", "get", "find" → READ   — e.g. {_first(groups["read"])}',
-        f'- "search", "query", "find by"      → SEARCH — e.g. {_first(groups["search"])}',
-        f'- "create", "add", "new"            → CREATE (confirm once) — e.g. {_first(groups["create"])}',
-        f'- "update", "change", "edit"        → UPDATE (confirm once) — e.g. {_first(groups["update"])}',
-        f'- "delete", "remove"               → DELETE (confirm TWICE) — e.g. {_first(groups["delete"])}',
+        f'- "show", "list", "get", "find", "what are", "display"  → READ   — e.g. {_first(groups["read"])}',
+        f'- "search", "query", "find by", "look up"                → SEARCH — e.g. {_first(groups["search"])}',
+        f'- "create", "add", "new", "make", "put", "insert"        → CREATE — e.g. {_first(groups["create"])}',
+        f'- "update", "change", "edit", "fix", "modify"            → UPDATE — e.g. {_first(groups["update"])}',
+        f'- "delete", "remove", "get rid of"                       → DELETE — e.g. {_first(groups["delete"])}',
     ]
     if groups["convert"]:
-        lines.append(f'- "convert"                        → CONVERT — e.g. {_first(groups["convert"])}')
+        lines.append(f'- "convert", "move to"                                    → CONVERT — e.g. {_first(groups["convert"])}')
     return "\n".join(lines)
 
 
 def _build_crm_guide(crm_label: str, tools: list) -> str:
-    """
-    Build a CRM-specific guide section entirely from the live tool list.
-    Zero hardcoded tool names, module names, or field names.
-    """
     groups     = _classify_tools(tools)
     tool_names = [getattr(t, "name", "") for t in tools]
     modules    = _infer_modules_from_tools(tool_names)
 
-    # Detect capability tools by name pattern
     def _find(pattern: str) -> str | None:
         return next((n for n in tool_names if pattern in n.lower()), None)
 
@@ -155,8 +138,6 @@ def _build_crm_guide(crm_label: str, tools: list) -> str:
     has_properties = _find("propert")
 
     lines = [f"## {crm_label} Guide", ""]
-
-    # Tool categories
     lines.append("**Available tool categories:**")
     lines.append("")
     for cat, lst in groups.items():
@@ -165,19 +146,17 @@ def _build_crm_guide(crm_label: str, tools: list) -> str:
                          (f" + {len(lst)-5} more" if len(lst) > 5 else ""))
     lines.append("")
 
-    # Inferred modules
     if modules:
         lines.append("**Detected record types** (inferred from tool names):")
         lines.append(", ".join(f"`{m}`" for m in modules))
         lines.append("")
 
-    # Workflows — use real tool names
     lines.append("**Key workflows:**")
     lines.append("")
     if has_modules:
         lines.append(f"- To list all available modules/objects → `{has_modules}`")
     if has_fields:
-        lines.append(f"- Before create/update, get exact field names → `{has_fields}`")
+        lines.append(f"- Before create/update, ALWAYS get exact field names first → `{has_fields}`")
     if has_properties:
         lines.append(f"- To list object properties → `{has_properties}`")
     if has_search:
@@ -189,32 +168,29 @@ def _build_crm_guide(crm_label: str, tools: list) -> str:
 
     lines += [
         "",
+        "**Field Discovery Workflow (REQUIRED before create/update):**",
+        "1. Call the fields/modules tool to get exact field API names for the target module.",
+        "2. Use ONLY field names returned by that tool — never guess field names.",
+        "3. Then call the create/update tool with those exact field names.",
+        "",
         "**Rules (CRITICAL):**",
         "- NEVER call the same tool with the same arguments twice.",
-        "  If a tool returns no useful data, STOP and tell the user what you found.",
-        "- Always check what parameters a tool requires before calling it.",
+        "- If a tool returns no useful data, STOP and report to the user.",
         "- Prefer search/query tools over listing all records when looking for a specific one.",
     ]
-
     return "\n".join(lines)
 
 
 def _build_multi_crm_section(clients_tools: dict[str, list]) -> str:
-    """
-    Build the multi-CRM section dynamically from connected clients.
-    No hardcoded CRM names or tool lists.
-    """
     lines = ["## Multi-CRM Guide", ""]
     lines.append("You have access to tools from **multiple CRM systems**:")
     lines.append("")
-
     for crm_key, tools in clients_tools.items():
         tool_names = [getattr(t, "name", "") for t in tools]
         sample = tool_names[:4]
         label  = crm_key.replace("_", " ").title()
         suffix = f" + {len(tool_names)-4} more" if len(tool_names) > 4 else ""
         lines.append(f"- **{label}** — {', '.join(f'`{x}`' for x in sample)}{suffix}")
-
     lines += [
         "",
         '**When the user asks about multiple CRMs:**',
@@ -228,38 +204,71 @@ def _build_multi_crm_section(clients_tools: dict[str, list]) -> str:
 
 
 # =============================================================================
-# Static preamble — universal rules only, no CRM-specific content
+# System prompt
 # =============================================================================
 
 _REACT_PREAMBLE = """\
-You are an expert CRM AI assistant. You operate using the **ReAct** (Reason + Act) method:
+You are an expert CRM AI assistant. You operate using the ReAct (Reason + Act) method:
 
 **ReAct Loop**
-1. **Thought** — Read the user's message, identify their intent, decide which tool to call.
-2. **Action** — Call the most appropriate tool with correct parameters.
-3. **Observation** — Read the tool result.
-4. **Repeat** — If the result is incomplete, call another tool. Stop when you have a full answer.
-5. **Answer** — Respond clearly in Markdown.
+1. Thought     — Read the user message. Identify intent even if phrased casually or with typos.
+2. Action      — Call the best tool with correct parameters.
+3. Observation — Read the tool result.
+4. Repeat      — If incomplete, call another tool. Stop when you have a full answer.
+5. Answer      — Respond clearly in Markdown.
+
+---
+
+## Language and Typo Handling
+
+Interpret the user's intent from casual or misspelled wording:
+- Phrases like "put anything", "you decide", "test data", "sample", "whatever" → generate realistic placeholder data on your own without prompting the user.
+- Phrases like "yes", "yep", "ok", "ya", "sure", "do it", "go ahead", "confirm" → treat as confirmation; skip re-confirmation and execute.
+- Words like "create", "make", "add", "new", "put", "craete" → CREATE intent.
+- Words like "show", "list", "get", "fetch", "display", "shwo" → READ intent.
+- Words like "update", "change", "edit", "fix", "modify" → UPDATE intent.
+- Words like "delete", "remove", "get rid of" → DELETE intent.
+
+---
+
+## Placeholder Data Guidelines
+
+When the user requests demo, test, or sample data:
+1. Generate realistic placeholder values on your own. Do not ask the user for specific values.
+2. Use plausible names, emails, phone numbers, and company names.
+3. Execute the action using the generated data.
+4. After completion, summarize what data was created.
+
+Example placeholder values:
+- Lead: Last_Name="Demo", First_Name="John", Company="Acme Corp", Email="john.demo@acme.com", Phone="+1-555-0123"
+- Contact: First_Name="Jane", Last_Name="Sample", Email="jane.sample@testco.com", Company="Test Co"
+- Deal: Deal_Name="Demo Deal Q1", Amount=10000, Stage="Qualification"
+- Account: Account_Name="Acme Corp", Industry="Technology", Phone="+1-555-9999"
+
+---
+
+## Confirmation Guidelines
+
+- Request confirmation once before create, update, or delete actions.
+- If the user has already confirmed in a prior message, execute immediately without asking again.
+- Read operations do not require confirmation.
+
+---
+
+## Permission Handling
+
+- PERMISSION_DENIED → report to the user: "Missing scope: [scope]. Please reconnect."
+- FORMAT_ERROR → retry once with corrected fields. If it fails again, report and stop.
+
+---
 
 {intent_section}
 
-**Output Format Rules (CRITICAL)**
-- NEVER output raw HTML
-- ALWAYS use clean Markdown: **bold**, ## headings, bullet lists, | tables |
-- Present ALL record lists as Markdown tables with clear column headers
-- If a tool errors, tell the user what went wrong and suggest a fix
+**Output:** Markdown only. Tables for record lists. Plain English for errors.
 
-**Confirmation Rules**
-- Ask for confirmation ONCE before any create/update/delete
-- If the user already confirmed ("yes", "do it", "confirm"), proceed immediately
-- Never confirm on read-only operations
+**Loop Guard:** Never call the same tool with identical args twice. Max 2 attempts per action.
 
-**Loop Prevention (CRITICAL)**
-- NEVER call the same tool with the same arguments more than once per turn
-- If a tool returns empty or unhelpful data, do NOT retry — report and stop
-- If you cannot complete the task, say so clearly
-
-**Available Tools**
+**Available Tools** (filtered to your current request)
 {tool_table}
 
 {crm_specific_section}
@@ -267,7 +276,7 @@ You are an expert CRM AI assistant. You operate using the **ReAct** (Reason + Ac
 
 
 # =============================================================================
-# Prompt builders — fully runtime, no hardcoded CRM knowledge
+# Prompt builders
 # =============================================================================
 
 def build_single_crm_prompt(crm_label: str, tools: list, extra_section: str = "") -> str:
@@ -298,8 +307,6 @@ def build_multi_crm_prompt(clients_tools: dict[str, list], extra_section: str = 
     )
 
 
-# ── Legacy wrappers — keep web_app.py untouched ──────────────────────────────
-
 def build_hubspot_prompt(tools: list, granted_scopes: list, is_admin: bool) -> str:
     tool_scope_map = build_tool_scope_map(granted_scopes)
     accessible = [t for t, s in tool_scope_map.items() if s]
@@ -312,7 +319,7 @@ def build_hubspot_prompt(tools: list, granted_scopes: list, is_admin: bool) -> s
     return build_single_crm_prompt("HubSpot", tools, extra_section="\n".join(perm_lines))
 
 
-def build_zoho_prompt(tools: list) -> str:
+def  build_zoho_prompt(tools: list) -> str:
     return build_single_crm_prompt("Zoho CRM", tools)
 
 
@@ -365,6 +372,66 @@ def _extract_final_text(result: dict) -> str:
     return "I could not generate a response. Please try again."
 
 
+_CONFIRM_RE = re.compile(
+    r"\b(yes|yep|yup|yeah|ya|sure|ok|okay|do it|go ahead|confirm|proceed|"
+    r"just do it|go for it|agreed|fine|correct|right|please do|make it|"
+    r"create it|add it)\b",
+    re.IGNORECASE,
+)
+
+_DEMO_RE = re.compile(
+    r"\b(demo|test[\s_-]?data|sample|anything|whatever|you\s+(can\s+)?decide|"
+    r"put\s+anything|make\s+(it\s+)?up|fill\s+it|use\s+(any|test|sample|fake|dummy)|"
+    r"don.?t\s+(care|matter)|just\s+(do|create|add|make))\b",
+    re.IGNORECASE,
+)
+
+
+def _has_prior_confirmation(history: list[dict]) -> bool:
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            if _CONFIRM_RE.search(msg.get("content", "")):
+                return True
+    return False
+
+
+def _augment_message(message: str, history: list[dict]) -> str:
+    hints: list[str] = []
+    if _has_prior_confirmation(history):
+        hints.append(
+            "Note: The user confirmed this action earlier in the conversation. "
+            "Skip the confirmation step and execute the requested action."
+        )
+    recent_user = " ".join(
+        m.get("content", "") for m in history[-3:] if m.get("role") == "user"
+    )
+    if _DEMO_RE.search(message) or _DEMO_RE.search(recent_user):
+        hints.append(
+            "Note: The user has requested placeholder or sample data. "
+            "Generate realistic values on your own and complete the action without asking for field values."
+        )
+    return message + ("\n\n" + "\n".join(hints) if hints else "")
+
+
+# =============================================================================
+# Cache management — exposed for web_app.py
+# =============================================================================
+
+async def evict_session(session_id: str):
+    """Call this when a session ends (disconnect, logout, browser close)."""
+    await _session_cache.evict(session_id)
+
+
+async def evict_stale_sessions():
+    """Call this from a background task periodically."""
+    await _session_cache.evict_stale()
+
+
+def get_cache_stats() -> dict:
+    """For /api/cache-stats debug endpoint."""
+    return _session_cache.stats()
+
+
 # =============================================================================
 # Public agent runners
 # =============================================================================
@@ -376,6 +443,7 @@ async def run_agent(
     agent: str = "hubspot",
     granted_scopes: list[str] | None = None,
     is_admin: bool = False,
+    session_id: str = "default",
 ) -> str:
     scopes = granted_scopes or []
     llm    = get_llm()
@@ -386,13 +454,19 @@ async def run_agent(
         {k: v for k, v in clients.items() if k == "hubspot"}
     )
 
-    tools = await get_langchain_tools(crm_clients, granted_scopes=scopes)
-    if not tools:
+    # Load ALL tools once per session, then filter per message
+    all_tools = await _session_cache.get_or_load(
+        session_id, agent, crm_clients, granted_scopes=scopes
+    )
+    if not all_tools:
         label = "Zoho CRM" if agent == "zoho_crm" else "HubSpot"
         return (
             f"⚠️ **{label} not connected.**\n\n"
             f"Please connect your {label} account using the **Connect** button in the sidebar."
         )
+
+    # Filter to only the relevant tools for this message
+    tools = _session_cache.filter_for_message(message, all_tools)
 
     system_prompt = (
         build_zoho_prompt(tools)     if agent == "zoho_crm" else
@@ -406,11 +480,11 @@ async def run_agent(
     )
 
     lc_messages = _history_to_lc(history)
-    lc_messages.append(HumanMessage(content=message))
+    lc_messages.append(HumanMessage(content=_augment_message(message, history)))
 
     result = await react_agent.ainvoke(
         {"messages": lc_messages},
-        config={"recursion_limit": 50},   # raised from 25
+        config={"recursion_limit": 50},
     )
     return _extract_final_text(result)
 
@@ -421,17 +495,22 @@ async def run_agent_both(
     clients: dict[str, "MCPClient"],
     granted_scopes: list[str] | None = None,
     is_admin: bool = False,
+    session_id: str = "default",
 ) -> str:
     scopes      = granted_scopes or []
     llm         = get_llm()
     crm_clients = {k: v for k, v in clients.items() if k in ("hubspot", "zoho_crm")}
-    tools       = await get_langchain_tools(crm_clients, granted_scopes=scopes)
 
-    if not tools:
+    all_tools = await _session_cache.get_or_load(
+        session_id, "both", crm_clients, granted_scopes=scopes
+    )
+    if not all_tools:
         return (
             "⚠️ **No CRM systems connected.**\n\n"
             "Connect at least one CRM from the sidebar."
         )
+
+    tools = _session_cache.filter_for_message(message, all_tools)
 
     system_prompt = build_both_prompt(tools, scopes, is_admin)
     react_agent   = create_react_agent(
@@ -441,7 +520,7 @@ async def run_agent_both(
     )
 
     lc_messages = _history_to_lc(history)
-    lc_messages.append(HumanMessage(content=message))
+    lc_messages.append(HumanMessage(content=_augment_message(message, history)))
 
     result = await react_agent.ainvoke(
         {"messages": lc_messages},

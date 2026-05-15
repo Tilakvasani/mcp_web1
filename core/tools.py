@@ -556,8 +556,7 @@ def _wrap_mcp_tool(
     crm_write_map   = _build_crm_write_map(granted_scopes)
     has_tool_access = tool_access_map.get(tool_name, True)  # unknown tools = allowed
 
-    # Compact schema log — just tool name + prop count, no JSON dump
-    log("schema", f"[{tool_name}] {len(schema.get('properties', {}))} props")
+    # Schema loaded — no per-tool log here (would fire 95x per request)
 
     async def _run(**kwargs) -> str:
         # ── 1. Tool-level guard ────────────────────────────────────────

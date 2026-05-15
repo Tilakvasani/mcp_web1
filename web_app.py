@@ -34,7 +34,7 @@ from crm_logger import log, suppress_noisy_libs
 suppress_noisy_libs()
 
 from mcp_client import MCPClient
-from core.agent import run_agent, run_agent_both
+from core.agent import run_agent, run_agent_both, evict_session, evict_stale_sessions, get_cache_stats
 from hubspot_oauth import (
     get_valid_token as hs_get_token,
     get_connection_status as hs_status,
@@ -198,6 +198,7 @@ async def _keepalive_loop():
     while True:
         await asyncio.sleep(MCPPool.PING_EVERY)
         await _pool.keepalive()
+        await evict_stale_sessions()   # clean up idle tool cache entries
 
 
 # =============================================================================
@@ -313,7 +314,7 @@ async def _make_zoho_client() -> tuple[MCPClient | None, str]:
 # Agent runner
 # =============================================================================
 
-async def _run_agent_turn(message: str, history: list, agent: str) -> dict:
+async def _run_agent_turn(message: str, history: list, agent: str, session_id: str = "default") -> dict:
     clients: dict[str, MCPClient] = {}
     scopes   = []
     is_admin = False
@@ -356,11 +357,13 @@ async def _run_agent_turn(message: str, history: list, agent: str) -> dict:
             text = await run_agent_both(
                 message=message, history=history, clients=clients,
                 granted_scopes=scopes, is_admin=is_admin,
+                session_id=session_id,
             )
         else:
             text = await run_agent(
                 message=message, history=history, clients=clients,
                 agent=agent, granted_scopes=scopes, is_admin=is_admin,
+                session_id=session_id,
             )
         elapsed = time.time() - t0
         log("ok", f"agent done → {len(text or '')} chars in {elapsed:.1f}s")
@@ -380,9 +383,9 @@ async def _run_agent_turn(message: str, history: list, agent: str) -> dict:
         return {"ok": False, "error": "agent_error", "detail": str(exc)}
 
 
-async def _stream_agent(message: str, history: list, agent: str):
-    log("stream", f"start | agent={agent} | '{message[:60]}'")
-    result = await _run_agent_turn(message, history, agent)
+async def _stream_agent(message: str, history: list, agent: str, session_id: str = "default"):
+    log("stream", f"start | agent={agent} | session={session_id[:8]} | '{message[:60]}'")
+    result = await _run_agent_turn(message, history, agent, session_id=session_id)
 
     if not result["ok"]:
         log("error", f"stream failed: {result['error']} — {result.get('detail','')}")
@@ -419,19 +422,20 @@ async def api_status():
 
 @app.post("/api/chat")
 async def api_chat(request: Request):
-    body    = await request.json()
-    message = body.get("message", "").strip()
-    history = body.get("history", [])
-    agent   = body.get("agent", "hubspot")
+    body       = await request.json()
+    message    = body.get("message", "").strip()
+    history    = body.get("history", [])
+    agent      = body.get("agent", "hubspot")
+    session_id = body.get("session_id", "default")
 
-    log("user", f"[{agent}] '{message[:80]}'")
+    log("user", f"[{agent}] [{session_id[:8]}] '{message[:80]}'")
 
     if not message:
         return JSONResponse({"error": "message required"}, status_code=400)
     if agent not in ("hubspot", "zoho_crm", "both"):
         return JSONResponse({"error": f"unknown agent: {agent}"}, status_code=400)
     return StreamingResponse(
-        _stream_agent(message, history, agent),
+        _stream_agent(message, history, agent, session_id=session_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -464,7 +468,28 @@ async def api_permissions():
     }
 
 
-@app.get("/api/debug-mcp")
+@app.post("/api/session/end")
+async def api_session_end(request: Request):
+    """
+    Call this when the user closes the chat / logs out.
+    Deletes the tool cache for that session so memory is freed immediately.
+    """
+    body       = await request.json()
+    session_id = body.get("session_id", "")
+    if not session_id:
+        return JSONResponse({"error": "session_id required"}, status_code=400)
+    await evict_session(session_id)
+    log("bye", f"session ended: {session_id[:8]}")
+    return {"evicted": True, "session_id": session_id}
+
+
+@app.get("/api/cache-stats")
+async def api_cache_stats():
+    """Debug endpoint — shows what's in the tool cache right now."""
+    return get_cache_stats()
+
+
+
 async def api_debug_mcp(crm: str = "hubspot"):
     log("debug", f"MCP test → crm={crm}")
     if crm == "zoho":
