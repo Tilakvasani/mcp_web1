@@ -1,10 +1,14 @@
 # Environment
 .env
 
-# HubSpot OAuth tokens — never commit this
+# OAuth tokens — never commit these
 .hubspot_tokens.json
 .zoho_tokens.json
+.zoho_mcp_url
+.zoho_disconnected
 
+# Backup files
+*.bak
 # Python
 __pycache__/
 *.pyc

@@ -4,7 +4,7 @@ Multi-CRM AI Agent — Streamlit Frontend (Improved)
 Clean UI using Streamlit-native components:
   - st.chat_message + st.chat_input  → sticky input, proper bubbles, fast
   - No 200-line CSS blob              → plain & fast rendering
-  - Status cached 30s                → no repeated HTTP on every rerun
+  - Status cached 10s                → responsive to connect/disconnect changes
   - st.write_stream                  → true live streaming with no placeholder hacks
 
 Run both servers:
@@ -13,6 +13,7 @@ Run both servers:
 """
 
 import json
+import uuid
 import requests
 import streamlit as st
 from crm_logger import log, suppress_noisy_libs
@@ -41,28 +42,26 @@ _DEFAULTS = {
     "active_agent": "hubspot",
     "active_tab":   "chat",
     "prefill":      "",
+    "session_id":   str(uuid.uuid4()),   # B5: unique per-browser-tab session
+    # B10: per-agent message history
+    "messages_hubspot":  [],
+    "messages_zoho_crm": [],
+    "messages_both":     [],
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 # ── Agent configs ──────────────────────────────────────────────────────────
+# B12: unified "prompts" list — used for both empty-state chips and sidebar quick commands
 AGENTS = {
     "hubspot": {
         "label": "HubSpot", "icon": "🟠",
         "placeholder": "Ask anything about your HubSpot CRM…",
-        "chips": [
+        "prompts": [
             ("📊 Pipeline overview",  "Summarise my HubSpot deal pipeline by stage"),
-            ("💼 Open deals",         "Show me all open deals"),
-            ("🔍 Find a contact",     "Find contact john@acme.com"),
-            ("➕ Create a deal",      "Create a deal for Acme Corp"),
-            ("📋 Recent activity",    "Show recent CRM activities"),
-            ("✅ Closed won",         "List deals closed won this quarter"),
-        ],
-        "quick_cmds": [
-            ("📊 Pipeline overview",  "Summarise my HubSpot deal pipeline by stage"),
-            ("🔍 Search contacts",    "Find all contacts added this week"),
             ("💼 Open deals",         "Show all open deals sorted by amount"),
+            ("🔍 Find a contact",     "Find contact john@acme.com"),
             ("➕ Create a deal",      "Create a new deal for Acme Corp worth $50,000"),
             ("📋 Recent activity",    "Show CRM activities from the last 7 days"),
             ("✅ Closed won",         "List all deals closed won this quarter"),
@@ -71,7 +70,7 @@ AGENTS = {
     "zoho_crm": {
         "label": "Zoho CRM", "icon": "🔵",
         "placeholder": "Ask anything about your Zoho CRM…",
-        "chips": [
+        "prompts": [
             ("🏆 All leads",     "Show me all leads in Zoho CRM"),
             ("👤 All contacts",  "List all contacts with email and phone"),
             ("💰 Open deals",    "Show all deals in the pipeline"),
@@ -79,29 +78,15 @@ AGENTS = {
             ("🔄 Convert lead",  "Help me convert a lead to a contact"),
             ("📊 All modules",   "List all available Zoho CRM modules"),
         ],
-        "quick_cmds": [
-            ("🏆 All leads",    "Show me all leads"),
-            ("👤 Contacts",     "Show me all contacts with email"),
-            ("💰 Deals",        "Show all deals grouped by stage"),
-            ("🏢 Accounts",     "Show me all accounts"),
-            ("🔄 Convert Lead", "Help me convert a lead"),
-            ("➕ Create Lead",  "Create a new lead"),
-        ],
     },
     "both": {
         "label": "Both CRMs", "icon": "⚡",
         "placeholder": "Query both HubSpot and Zoho CRM simultaneously…",
-        "chips": [
+        "prompts": [
             ("💰 All deals (both)",    "Show me all open deals from both CRMs"),
             ("👤 All contacts (both)", "Show all contacts from both CRMs"),
             ("📊 Compare pipelines",   "Compare pipelines from HubSpot and Zoho"),
             ("🏆 All leads (both)",    "Show all leads from both CRMs"),
-        ],
-        "quick_cmds": [
-            ("💰 All Deals",    "Show all open deals from both CRMs"),
-            ("👤 All Contacts", "Show all contacts from both CRMs"),
-            ("📊 Compare",      "Compare pipelines from HubSpot and Zoho"),
-            ("🏆 All Leads",    "Show all leads from both CRMs"),
         ],
     },
 }
@@ -118,10 +103,11 @@ def api(path: str, method: str = "GET", **kwargs) -> dict:
 
 def api_stream_chat(message: str, history: list, agent: str):
     """Yield text chunks from SSE stream — compatible with st.write_stream."""
+    session_id = st.session_state.get("session_id", "default")   # B5
     try:
         with requests.post(
             f"{BACKEND}/api/chat",
-            json={"message": message, "history": history, "agent": agent},
+            json={"message": message, "history": history, "agent": agent, "session_id": session_id},
             stream=True, timeout=120,
             headers={"Accept": "text/event-stream"},
         ) as resp:
@@ -158,13 +144,16 @@ def _fmt_error(error: str, detail: str, agent: str) -> str:
         "preflight_failed":   f"🌐 Cannot reach MCP server. Detail: `{detail}`",
         "hubspot_unavailable":"🔑 HubSpot not connected — click **Connect HubSpot**.",
         "no_clients":         "⚠️ No CRM connected. Connect at least one from the sidebar.",
+        "content_filter":     "🛡️ Your request was flagged by content safety filters. Please try rephrasing your message.",
+        "rate_limit":         "⏳ Too many requests — please wait a moment and try again.",
+        "auth_error":         "🔑 AI service authentication failed. Please check your API key configuration.",
     }
     return f"\n\n{msgs.get(error, f'❌ {detail or error}')}"
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)   # B18: reduced from 30s to 10s
 def get_status() -> dict:
-    """Cache status 30 s — avoids an HTTP call on every Streamlit rerun."""
+    """Cache status 10s — responsive to connect/disconnect changes."""
     return api("/api/status")
 
 # ── OAuth callback ──────────────────────────────────────────────────────────
@@ -177,6 +166,25 @@ def _handle_oauth_callback():
     elif err := p.get("oauth_error", ""):
         st.session_state["_err"] = err
         st.query_params.clear()
+
+
+# ── Agent history helpers (B10) ──────────────────────────────────────────────
+
+def _get_messages_key(agent: str) -> str:
+    return f"messages_{agent}"
+
+
+def _get_messages() -> list:
+    """Return the message list for the active agent."""
+    key = _get_messages_key(st.session_state.active_agent)
+    return st.session_state.get(key, [])
+
+
+def _set_messages(msgs: list):
+    """Set the message list for the active agent."""
+    key = _get_messages_key(st.session_state.active_agent)
+    st.session_state[key] = msgs
+
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
@@ -193,10 +201,11 @@ def _sidebar(status: dict):
                 active = st.session_state.active_agent == ag
                 if st.button(lbl, key=f"ag_{ag}", use_container_width=True,
                               type="primary" if active else "secondary"):
-                    log("info", f"agent switched → {ag}", source="frontend")
-                    st.session_state.active_agent = ag
-                    st.session_state.messages     = []
-                    st.rerun()
+                    if ag != st.session_state.active_agent:
+                        # B10: switch agent — preserve current history, load target history
+                        log("info", f"agent switched → {ag}", source="frontend")
+                        st.session_state.active_agent = ag
+                        st.rerun()
 
         st.divider()
 
@@ -272,10 +281,10 @@ def _sidebar(status: dict):
 
         st.divider()
 
-        # Quick commands
+        # Quick commands — B12: reuse the unified "prompts" list
         cfg = AGENTS[st.session_state.active_agent]
         st.markdown(f"**Quick · {cfg['icon']} {cfg['label']}**")
-        for label, prompt in cfg["quick_cmds"]:
+        for label, prompt in cfg["prompts"]:
             if st.button(label, key=f"qcmd_{label}", use_container_width=True):
                 log("info", f"quick cmd → {label}", source="frontend")
                 st.session_state.prefill    = prompt
@@ -284,7 +293,7 @@ def _sidebar(status: dict):
 
         st.divider()
         if st.button("🗑️ Clear Chat", use_container_width=True):
-            st.session_state.messages = []
+            _set_messages([])
             st.session_state.prefill  = ""
             st.rerun()
 
@@ -315,9 +324,9 @@ def _header(status: dict):
 def _chat():
     agent = st.session_state.active_agent
     cfg   = AGENTS[agent]
-    msgs  = st.session_state.messages
+    msgs  = _get_messages()   # B10: per-agent history
 
-    # Empty state — quick action chips
+    # Empty state — quick action chips (B12: reuse unified prompts)
     if not msgs:
         st.markdown(f"#### {cfg['icon']} {cfg['label']} Agent ready")
         st.markdown(
@@ -326,9 +335,10 @@ def _chat():
         )
         st.markdown("**Try a quick action:**")
         chip_cols = st.columns(3)
-        for i, (label, prompt) in enumerate(cfg["chips"]):
+        for i, (label, prompt) in enumerate(cfg["prompts"]):
             with chip_cols[i % 3]:
-                if st.button(label, key=f"chip_{i}", use_container_width=True):
+                # B17: scope chip keys to active agent
+                if st.button(label, key=f"chip_{agent}_{i}", use_container_width=True):
                     st.session_state.prefill = prompt
                     st.rerun()
         st.divider()
@@ -358,13 +368,16 @@ def _send(text: str):
     cfg   = AGENTS[agent]
 
     log("user", f"[{agent}] '{text[:80]}'", source="frontend")
-    st.session_state.messages.append({"role": "user", "content": text, "agent": agent})
+    msgs = _get_messages()
+    msgs.append({"role": "user", "content": text, "agent": agent})
+    _set_messages(msgs)
+
     with st.chat_message("user", avatar="👤"):
         st.markdown(text)
 
     history = [
         {"role": m["role"], "content": m["content"]}
-        for m in st.session_state.messages[:-1]
+        for m in msgs[:-1]
     ]
 
     import time as _time
@@ -375,15 +388,16 @@ def _send(text: str):
     _elapsed = _time.time() - _t0
     log("ai", f"[{agent}] response → {len(full or '')} chars in {_elapsed:.1f}s", source="frontend")
 
-    st.session_state.messages.append({
+    msgs.append({
         "role": "assistant",
         "content": full or "⚠️ No response received.",
         "agent": agent,
     })
+    _set_messages(msgs)
 
 # ── Permissions tab ──────────────────────────────────────────────────────────
 
-def _permissions():
+def _permissions(status: dict):    # B14: accept cached status dict
     st.markdown("### 🔑 HubSpot Permissions")
     st.caption("Live data from `/api/permissions`")
 
@@ -402,10 +416,10 @@ def _permissions():
         for t in data.get("tools", []):
             st.markdown(f"{'✅' if t['accessible'] else '🚫'} `{t['tool']}`")
     with col2:
+        # B14: use the cached status dict instead of making a new HTTP call
         st.markdown("**Connection Status**")
-        s = api("/api/status")
-        ok = s.get("hubspot", {}).get("connected", False)
-        msg = s.get("hubspot", {}).get("message", "")
+        ok = status.get("hubspot", {}).get("connected", False)
+        msg = status.get("hubspot", {}).get("message", "")
         (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {msg}")
 
     st.divider()
@@ -480,6 +494,11 @@ def main():
         st.toast(f"❌ OAuth error: {err}", icon="⚠️")
 
     status = get_status()
+
+    # B16: show error banner when backend is unreachable
+    if "_error" in status:
+        st.error(f"⚠️ Backend unreachable — is uvicorn running on :8000?\n\n`{status['_error']}`")
+
     _sidebar(status)
     _header(status)
 
@@ -487,7 +506,7 @@ def main():
     if tab == "chat":
         _chat()
     elif tab == "permissions":
-        _permissions()
+        _permissions(status)    # B14: pass cached status
     elif tab == "debug":
         _debug()
 

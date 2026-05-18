@@ -37,6 +37,7 @@ _ICONS = {
     "schema":  "📋",
     "debug":   "🐛",
     "time":    "⏱️ ",
+    "cache":   "🗄️ ",
 }
 
 _LABELS = {
@@ -58,6 +59,7 @@ _LABELS = {
     "schema":  "SCHM",
     "debug":   "DBG ",
     "time":    "TIME",
+    "cache":   "CACH",
 }
 
 

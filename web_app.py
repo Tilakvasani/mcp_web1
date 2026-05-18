@@ -34,7 +34,7 @@ from crm_logger import log, suppress_noisy_libs
 suppress_noisy_libs()
 
 from mcp_client import MCPClient
-from core.agent import run_agent, run_agent_both, evict_session, evict_stale_sessions, get_cache_stats
+from core.agent import run_agent, run_agent_both, evict_session, evict_stale_sessions, evict_all_sessions, get_cache_stats
 from hubspot_oauth import (
     get_valid_token as hs_get_token,
     get_connection_status as hs_status,
@@ -58,15 +58,45 @@ from zoho_auth import (
     ZOHO_CLIENT_ID as ZO_CLIENT_ID,
     MCP_URL_FILE,
 )
-from core.tools import describe_scopes, build_tool_scope_map
+from core.tools import describe_scopes, get_tool_scope_map
 
 load_dotenv()
 
 HUBSPOT_MCP_URL = os.getenv("HUBSPOT_MCP_URL", "https://mcp.hubspot.com/")
 STREAMLIT_URL   = os.getenv("STREAMLIT_URL", "http://localhost:8501")
 
-_hs_pkce: dict[str, str] = {}
-_zo_pkce: dict[str, str] = {}
+# ---------------------------------------------------------------------------
+# PKCE verifier store — TTL-pruned to prevent memory leaks (B6)
+# ---------------------------------------------------------------------------
+
+class _TTLDict:
+    """Dict that stores (value, timestamp) and prunes entries older than max_age on insert."""
+    def __init__(self, max_age: int = 600):
+        self._data: dict[str, tuple[str, float]] = {}
+        self._max_age = max_age
+
+    def __setitem__(self, key: str, value: str):
+        self._prune()
+        self._data[key] = (value, time.time())
+
+    def pop(self, key: str, default=None) -> str | None:
+        entry = self._data.pop(key, None)
+        if entry is None:
+            return default
+        value, ts = entry
+        if time.time() - ts > self._max_age:
+            return default  # expired
+        return value
+
+    def _prune(self):
+        now = time.time()
+        stale = [k for k, (_, ts) in self._data.items() if now - ts > self._max_age]
+        for k in stale:
+            del self._data[k]
+
+
+_hs_pkce = _TTLDict(max_age=600)   # 10 minute TTL
+_zo_pkce = _TTLDict(max_age=600)
 
 
 # =============================================================================
@@ -380,6 +410,19 @@ async def _run_agent_turn(message: str, history: list, agent: str, session_id: s
             await _pool.invalidate("hubspot")
         if agent in ("zoho_crm", "both"):
             await _pool.invalidate("zoho_crm")
+
+        # Friendly error codes for common failures
+        err_str = str(exc).lower()
+        if "content_filter" in err_str or "responsibleaipolicyviolation" in err_str:
+            return {"ok": False, "error": "content_filter",
+                    "detail": "Your message could not be processed due to content safety filters. Please rephrase and try again."}
+        if "rate_limit" in err_str or "429" in err_str:
+            return {"ok": False, "error": "rate_limit",
+                    "detail": "Too many requests. Please wait a moment and try again."}
+        if "authentication" in err_str or "401" in err_str:
+            return {"ok": False, "error": "auth_error",
+                    "detail": "AI service authentication failed. Check your API key."}
+
         return {"ok": False, "error": "agent_error", "detail": str(exc)}
 
 
@@ -455,7 +498,7 @@ async def api_permissions():
             is_admin = await check_is_admin(token, user_id)
     except Exception:
         pass
-    tool_scope_map = build_tool_scope_map(scopes)
+    tool_scope_map = get_tool_scope_map(scopes)
     log("ok", f"permissions → {len(scopes)} scopes | admin={is_admin}")
     return {
         "connected": True,
@@ -490,6 +533,7 @@ async def api_cache_stats():
 
 
 
+@app.get("/api/debug-mcp")
 async def api_debug_mcp(crm: str = "hubspot"):
     log("debug", f"MCP test → crm={crm}")
     if crm == "zoho":
@@ -565,6 +609,7 @@ async def api_disconnect():
     if HS_TOKEN_FILE.exists():
         HS_TOKEN_FILE.unlink()
     await _pool.invalidate("hubspot")
+    await evict_all_sessions()   # flush tool cache so new account gets fresh scope guards
     log("bye", "HubSpot disconnected")
     return {"disconnected": True}
 
@@ -596,6 +641,10 @@ async def zoho_callback(code: str = "", state: str = "", error: str = "", error_
     try:
         zo_exchange(code=code, code_verifier=verifier)
         log("ok", "Zoho tokens exchanged ✓")
+        # B9: clear disconnect sentinel on successful reconnect
+        from zoho_auth import DISCONNECT_SENTINEL
+        if DISCONNECT_SENTINEL.exists():
+            DISCONNECT_SENTINEL.unlink()
     except ValueError as exc:
         log("error", f"Zoho token exchange failed: {exc}")
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={exc}&crm=zoho")
@@ -610,6 +659,10 @@ async def zoho_save_mcp_url(request: Request):
     if not url:
         return JSONResponse({"error": "url required"}, status_code=400)
     save_mcp_url(url)
+    # B9: clear disconnect sentinel when user re-saves MCP URL
+    from zoho_auth import DISCONNECT_SENTINEL
+    if DISCONNECT_SENTINEL.exists():
+        DISCONNECT_SENTINEL.unlink()
     await _pool.invalidate("zoho_crm")
     log("info", f"Zoho MCP URL saved → {url[:60]}")
     client = MCPClient(url=url, headers={})
@@ -624,7 +677,11 @@ async def zoho_disconnect():
         ZO_TOKEN_FILE.unlink()
     if MCP_URL_FILE.exists():
         MCP_URL_FILE.unlink()
+    # B9: write sentinel so get_mcp_url() won't fall back to env var
+    from zoho_auth import DISCONNECT_SENTINEL
+    DISCONNECT_SENTINEL.write_text("disconnected")
     await _pool.invalidate("zoho_crm")
+    await evict_all_sessions()   # flush tool cache so new account gets fresh scope guards
     log("bye", "Zoho disconnected")
     return {"disconnected": True}
 

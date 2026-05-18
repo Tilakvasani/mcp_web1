@@ -43,10 +43,10 @@ SESSION_TTL = 600   # seconds of inactivity before auto-evict (10 min)
 
 _INTENT_MAP: list[tuple[list[str], list[str]]] = [
     # keywords in user message        → tool name substrings to keep
-    (["lead"],                         ["Lead"]),
-    (["deal", "opportunity"],          ["Deal"]),
+    (["lead", "laed"],                 ["Lead"]),
+    (["deal", "opportunity", "dael"],  ["Deal"]),
     (["account", "company"],           ["Account"]),
-    (["contact"],                      ["Contact"]),
+    (["contact", "coantact", "contct"],["Contact"]),
     (["convert"],                      ["Lead", "Contact", "Account", "Deal", "convert"]),
     (["workflow"],                     ["Workflow", "workflow"]),
     (["email"],                        ["Email", "email"]),
@@ -56,17 +56,30 @@ _INTENT_MAP: list[tuple[list[str], list[str]]] = [
     (["configuration", "config"],      ["Configuration"]),
 ]
 
-# Tools that are always included regardless of intent (utility / meta tools)
-_ALWAYS_INCLUDE: list[str] = [
-    "getModules", "getFields", "getMetaFields",  # Zoho field discovery
-    "get_properties", "get_object_types",         # HubSpot field discovery
-]
+# Collect ALL module substrings from the intent map — used to detect generic tools dynamically
+_ALL_MODULE_SUBSTRINGS: list[str] = []
+for _, modules in _INTENT_MAP:
+    _ALL_MODULE_SUBSTRINGS.extend(modules)
+_ALL_MODULE_SUBSTRINGS = list(set(_ALL_MODULE_SUBSTRINGS))  # dedupe
+
+
+def _is_generic_tool(tool_name: str) -> bool:
+    """
+    A tool is 'generic' if its name doesn't contain ANY module-specific substring
+    from the intent map. Generic tools (like HubSpot's manage_crm_objects,
+    search_crm_objects, get_properties) work across all object types via parameters
+    and must always be included regardless of intent filtering.
+    """
+    return not any(mod in tool_name for mod in _ALL_MODULE_SUBSTRINGS)
 
 
 def filter_tools_by_intent(message: str, tools: list) -> list:
     """
     Given a user message and the full tool list, return only the tools
     relevant to the detected intent.
+
+    Generic/utility tools (names that don't contain any module keyword) are
+    always included — they handle all object types via parameters.
 
     Falls back to ALL tools if no intent is matched (safe default).
     """
@@ -85,8 +98,8 @@ def filter_tools_by_intent(message: str, tools: list) -> list:
     filtered = [
         t for t in tools
         if (
-            any(mod in t.name for mod in matched_modules)
-            or any(always in t.name for always in _ALWAYS_INCLUDE)
+            any(mod in t.name for mod in matched_modules)  # module-specific match
+            or _is_generic_tool(t.name)                    # generic/utility tool
         )
     ]
 
@@ -106,6 +119,7 @@ def filter_tools_by_intent(message: str, tools: list) -> list:
 class _CacheEntry:
     tools:      list
     agent:      str
+    client_ids: frozenset = field(default_factory=frozenset)  # track which MCP clients built these tools
     created_at: float = field(default_factory=time.time)
     last_used:  float = field(default_factory=time.time)
 
@@ -137,6 +151,11 @@ class SessionToolCache:
         self._cache: dict[str, _CacheEntry] = {}
         self._lock  = asyncio.Lock()
 
+    @staticmethod
+    def _client_ids(crm_clients: dict) -> frozenset:
+        """Snapshot the identity of each MCP client so we detect reconnects."""
+        return frozenset(id(c) for c in crm_clients.values())
+
     async def get_or_load(
         self,
         session_id: str,
@@ -149,24 +168,41 @@ class SessionToolCache:
           - session not in cache
           - session cached a different agent
           - cache entry is stale
+          - underlying MCP clients changed (pool reconnected after ClosedResourceError)
         """
+        current_ids = self._client_ids(crm_clients)
+
         async with self._lock:
             entry = self._cache.get(session_id)
 
-        # Cache HIT — same agent, not stale
-        if entry and entry.agent == agent and not entry.is_stale():
+        # Cache HIT — same agent, same clients, not stale
+        if (entry
+                and entry.agent == agent
+                and entry.client_ids == current_ids
+                and not entry.is_stale()):
             entry.touch()
             log("cache", f"HIT session={session_id[:8]} agent={agent} tools={len(entry.tools)}")
             return entry.tools
 
-        # Cache MISS or stale — load fresh
-        reason = "MISS" if not entry else ("STALE" if entry.is_stale() else "AGENT_CHANGE")
+        # Cache MISS — determine reason for logging
+        if not entry:
+            reason = "MISS"
+        elif entry.is_stale():
+            reason = "STALE"
+        elif entry.agent != agent:
+            reason = "AGENT_CHANGE"
+        elif entry.client_ids != current_ids:
+            reason = "CLIENT_RECONNECT"
+        else:
+            reason = "MISS"
         log("cache", f"{reason} session={session_id[:8]} agent={agent} — loading tools…")
 
         tools = await get_langchain_tools(crm_clients, granted_scopes=granted_scopes or [])
 
         async with self._lock:
-            self._cache[session_id] = _CacheEntry(tools=tools, agent=agent)
+            self._cache[session_id] = _CacheEntry(
+                tools=tools, agent=agent, client_ids=current_ids,
+            )
 
         log("cache", f"STORED session={session_id[:8]} — {len(tools)} tools cached")
         return tools
@@ -190,6 +226,14 @@ class SessionToolCache:
                 del self._cache[sid]
         if stale:
             log("cache", f"TTL evicted {len(stale)} stale session(s)")
+
+    async def evict_all(self):
+        """Remove ALL cached sessions. Call on disconnect/account switch."""
+        async with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+        if count:
+            log("cache", f"evicted ALL {count} session(s) (account switch)")
 
     def stats(self) -> dict:
         return {

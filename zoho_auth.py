@@ -27,12 +27,14 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 
-TOKEN_FILE   = Path(__file__).parent / ".zoho_tokens.json"
-MCP_URL_FILE = Path(__file__).parent / ".zoho_mcp_url"
+TOKEN_FILE          = Path(__file__).parent / ".zoho_tokens.json"
+MCP_URL_FILE        = Path(__file__).parent / ".zoho_mcp_url"
+DISCONNECT_SENTINEL = Path(__file__).parent / ".zoho_disconnected"   # B9
 
 ZOHO_CLIENT_ID     = os.getenv("ZOHO_CLIENT_ID", "")
 ZOHO_CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET", "")
-ZOHO_REDIRECT_URI  = os.getenv("ZOHO_REDIRECT_URI", "http://localhost:8000/zoho/callback")
+# B2: accept both URI and URL spellings; prefer URI, fall back to URL
+ZOHO_REDIRECT_URI  = os.getenv("ZOHO_REDIRECT_URI") or os.getenv("ZOHO_REDIRECT_URL", "http://localhost:8000/zoho/callback")
 ZOHO_ACCOUNTS_URL  = os.getenv("ZOHO_ACCOUNTS_URL", "https://accounts.zoho.in")
 
 ZOHO_SCOPES = [
@@ -166,6 +168,9 @@ def save_mcp_url(url: str) -> None:
 
 
 def get_mcp_url() -> Optional[str]:
+    # B9: if user explicitly disconnected, don't fall back to env var
+    if DISCONNECT_SENTINEL.exists():
+        return None
     if MCP_URL_FILE.exists():
         url = MCP_URL_FILE.read_text().strip()
         return url if url else None

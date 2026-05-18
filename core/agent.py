@@ -18,7 +18,7 @@ from langgraph.prebuilt import create_react_agent
 from dotenv import load_dotenv
 
 from mcp_client import MCPClient
-from core.tools import get_langchain_tools, build_tool_scope_map, describe_scopes
+from core.tools import get_langchain_tools, get_tool_scope_map, describe_scopes
 from core.session_cache import SessionToolCache
 
 load_dotenv()
@@ -37,7 +37,7 @@ def get_llm() -> AzureChatOpenAI:
         azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
         azure_endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_key          = api_key,
-        api_version      = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        api_version      = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
         temperature      = 0.1,
         max_tokens       = 8000,
     )
@@ -168,14 +168,14 @@ def _build_crm_guide(crm_label: str, tools: list) -> str:
 
     lines += [
         "",
-        "**Field Discovery Workflow (REQUIRED before create/update):**",
+        "**Field Discovery Workflow (before create/update):**",
         "1. Call the fields/modules tool to get exact field API names for the target module.",
-        "2. Use ONLY field names returned by that tool — never guess field names.",
+        "2. Use only field names returned by that tool.",
         "3. Then call the create/update tool with those exact field names.",
         "",
-        "**Rules (CRITICAL):**",
-        "- NEVER call the same tool with the same arguments twice.",
-        "- If a tool returns no useful data, STOP and report to the user.",
+        "**Best practices:**",
+        "- Avoid calling the same tool with the same arguments twice.",
+        "- If a tool returns no useful data, report to the user and stop.",
         "- Prefer search/query tools over listing all records when looking for a specific one.",
     ]
     return "\n".join(lines)
@@ -197,8 +197,7 @@ def _build_multi_crm_section(clients_tools: dict[str, list]) -> str:
         "1. Query each CRM in sequence using its own tools.",
         "2. Present combined results in a Markdown table with a **Source** column.",
         "",
-        "**When the user asks about one CRM specifically**, only use that CRM's tools.",
-        "**NEVER call the same tool with the same arguments more than once.**",
+        "When the user asks about one CRM specifically, only use that CRM's tools.",
     ]
     return "\n".join(lines)
 
@@ -208,67 +207,56 @@ def _build_multi_crm_section(clients_tools: dict[str, list]) -> str:
 # =============================================================================
 
 _REACT_PREAMBLE = """\
-You are an expert CRM AI assistant. You operate using the ReAct (Reason + Act) method:
+You are a CRM assistant that helps users manage their data using available tools.
 
-**ReAct Loop**
-1. Thought     — Read the user message. Identify intent even if phrased casually or with typos.
-2. Action      — Call the best tool with correct parameters.
-3. Observation — Read the tool result.
-4. Repeat      — If incomplete, call another tool. Stop when you have a full answer.
-5. Answer      — Respond clearly in Markdown.
+## How You Work
 
----
+You follow a structured approach:
+1. Understand what the user is asking for.
+2. Call the appropriate tool with correct parameters.
+3. Read the result and decide if more information is needed.
+4. Respond with a clear, formatted answer in Markdown.
 
-## Language and Typo Handling
+## Understanding User Input
 
-Interpret the user's intent from casual or misspelled wording:
-- Phrases like "put anything", "you decide", "test data", "sample", "whatever" → generate realistic placeholder data on your own without prompting the user.
-- Phrases like "yes", "yep", "ok", "ya", "sure", "do it", "go ahead", "confirm" → treat as confirmation; skip re-confirmation and execute.
-- Words like "create", "make", "add", "new", "put", "craete" → CREATE intent.
-- Words like "show", "list", "get", "fetch", "display", "shwo" → READ intent.
-- Words like "update", "change", "edit", "fix", "modify" → UPDATE intent.
-- Words like "delete", "remove", "get rid of" → DELETE intent.
+Users may write casually or with typos. Interpret their intent:
+- "create", "make", "add", "new" → they want to create a record.
+- "show", "list", "get", "fetch" → they want to read data.
+- "update", "change", "edit" → they want to modify a record.
+- "delete", "remove" → they want to delete a record.
+- "yes", "ok", "sure", "do it", "go ahead" → they are confirming a previous action.
+- "sample", "demo", "test data", "you decide" → they want you to fill in reasonable values.
 
----
+## Working with Sample Data
 
-## Placeholder Data Guidelines
+When asked to create sample or demo records, use plausible values such as:
+- Names: "John Demo", "Jane Sample"
+- Emails: "john.demo@acme.com"
+- Companies: "Acme Corp", "Test Co"
+- Amounts: 10000, 25000
 
-When the user requests demo, test, or sample data:
-1. Generate realistic placeholder values on your own. Do not ask the user for specific values.
-2. Use plausible names, emails, phone numbers, and company names.
-3. Execute the action using the generated data.
-4. After completion, summarize what data was created.
+## Confirmations
 
-Example placeholder values:
-- Lead: Last_Name="Demo", First_Name="John", Company="Acme Corp", Email="john.demo@acme.com", Phone="+1-555-0123"
-- Contact: First_Name="Jane", Last_Name="Sample", Email="jane.sample@testco.com", Company="Test Co"
-- Deal: Deal_Name="Demo Deal Q1", Amount=10000, Stage="Qualification"
-- Account: Account_Name="Acme Corp", Industry="Technology", Phone="+1-555-9999"
+- For create, update, or delete actions: confirm with the user once before proceeding.
+- If the user already said "yes" or "confirm" in their previous message, proceed directly.
+- Read-only actions (list, search, get) do not need confirmation.
 
----
+## Error Handling
 
-## Confirmation Guidelines
+- If a tool returns a permission error, let the user know which scope is missing.
+- If a tool returns a format error, try once more with corrected parameters.
+- If a tool returns no useful data, let the user know.
 
-- Request confirmation once before create, update, or delete actions.
-- If the user has already confirmed in a prior message, execute immediately without asking again.
-- Read operations do not require confirmation.
+## Tool Usage
 
----
-
-## Permission Handling
-
-- PERMISSION_DENIED → report to the user: "Missing scope: [scope]. Please reconnect."
-- FORMAT_ERROR → retry once with corrected fields. If it fails again, report and stop.
-
----
+- Avoid calling the same tool with identical arguments more than once per request.
+- Limit retries to 2 attempts per action.
 
 {intent_section}
 
-**Output:** Markdown only. Tables for record lists. Plain English for errors.
+**Output format:** Markdown. Use tables for record lists.
 
-**Loop Guard:** Never call the same tool with identical args twice. Max 2 attempts per action.
-
-**Available Tools** (filtered to your current request)
+**Available Tools:**
 {tool_table}
 
 {crm_specific_section}
@@ -308,7 +296,7 @@ def build_multi_crm_prompt(clients_tools: dict[str, list], extra_section: str = 
 
 
 def build_hubspot_prompt(tools: list, granted_scopes: list, is_admin: bool) -> str:
-    tool_scope_map = build_tool_scope_map(granted_scopes)
+    tool_scope_map = get_tool_scope_map(granted_scopes)
     accessible = [t for t, s in tool_scope_map.items() if s]
     blocked    = [t for t, s in tool_scope_map.items() if not s]
     perm_lines = [f"**Your role:** {'🔑 Super Admin' if is_admin else '👤 Standard User'}"]
@@ -388,10 +376,10 @@ _DEMO_RE = re.compile(
 
 
 def _has_prior_confirmation(history: list[dict]) -> bool:
+    # B15: only check the immediately preceding user message, not all history
     for msg in reversed(history):
         if msg.get("role") == "user":
-            if _CONFIRM_RE.search(msg.get("content", "")):
-                return True
+            return bool(_CONFIRM_RE.search(msg.get("content", "")))
     return False
 
 
@@ -399,16 +387,14 @@ def _augment_message(message: str, history: list[dict]) -> str:
     hints: list[str] = []
     if _has_prior_confirmation(history):
         hints.append(
-            "Note: The user confirmed this action earlier in the conversation. "
-            "Skip the confirmation step and execute the requested action."
+            "(The user has already confirmed this action in a previous message.)"
         )
     recent_user = " ".join(
         m.get("content", "") for m in history[-3:] if m.get("role") == "user"
     )
     if _DEMO_RE.search(message) or _DEMO_RE.search(recent_user):
         hints.append(
-            "Note: The user has requested placeholder or sample data. "
-            "Generate realistic values on your own and complete the action without asking for field values."
+            "(The user wants sample or demo data. Use reasonable placeholder values.)"
         )
     return message + ("\n\n" + "\n".join(hints) if hints else "")
 
@@ -425,6 +411,11 @@ async def evict_session(session_id: str):
 async def evict_stale_sessions():
     """Call this from a background task periodically."""
     await _session_cache.evict_stale()
+
+
+async def evict_all_sessions():
+    """Call this on disconnect / account switch to flush stale scope guards."""
+    await _session_cache.evict_all()
 
 
 def get_cache_stats() -> dict:

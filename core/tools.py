@@ -49,7 +49,7 @@ _mcp_logger.propagate = False
 # ---------------------------------------------------------------------------
 # Tool-level scope check  (derived dynamically from the token scopes)
 # ---------------------------------------------------------------------------
-def _build_tool_scope_map(granted_scopes: set[str]) -> dict[str, bool]:
+def _check_tool_access(granted_scopes: set[str]) -> dict[str, bool]:
     """
     Build a {tool_name: has_access} map entirely from the token's own scopes.
     No hardcoded lists — patterns are derived from scope strings directly.
@@ -286,7 +286,7 @@ def describe_scopes(scopes: list[str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Build tool access map for web_app.py  (dynamic, from live scopes)
 # ---------------------------------------------------------------------------
-def build_tool_scope_map(granted_scopes: list[str]) -> dict[str, list[str]]:
+def get_tool_scope_map(granted_scopes: list[str]) -> dict[str, list[str]]:
     """
     Return a {tool_name: [matching_scopes]} map derived from the token's own
     scopes — used by web_app.py /api/permissions to show which tools are
@@ -552,7 +552,7 @@ def _wrap_mcp_tool(
         ArgsModel = create_model(f"{safe}_Args", **existing)
 
     # Build dynamic maps once per tool wrap (not per call)
-    tool_access_map = _build_tool_scope_map(granted_scopes)
+    tool_access_map = _check_tool_access(granted_scopes)
     crm_write_map   = _build_crm_write_map(granted_scopes)
     has_tool_access = tool_access_map.get(tool_name, True)  # unknown tools = allowed
 
