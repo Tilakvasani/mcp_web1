@@ -1,5 +1,15 @@
 # Multi-CRM AI Agent — LangChain + LangGraph
 
+> **⚠️ Security & Multi-User Notice**
+>
+> - This app stores **one OAuth token per CRM** in local files (`.zoho_tokens.json`, `.hubspot_tokens.json`).
+>   If multiple users connect, each new login **overwrites** the previous user's token.
+>   This is a **single-user-per-CRM** app by design. Do not expose it publicly without adding per-user token isolation.
+> - **Never commit `.env`, `.zoho_tokens.json`, or `.hubspot_tokens.json`** to version control.
+>   All three contain live credentials. They are in `.gitignore` — keep them there.
+> - Rate limiting: `/api/chat` allows **15 requests per 60 seconds** per session.
+
+
 A FastAPI web app that connects to **HubSpot** and/or **Zoho CRM** via MCP
 using **LangGraph's ReAct agent** and Azure OpenAI.
 

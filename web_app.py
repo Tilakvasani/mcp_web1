@@ -463,6 +463,28 @@ async def api_status():
     }
 
 
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter — no external deps needed (B19)
+# ---------------------------------------------------------------------------
+_rate_store: dict[str, list[float]] = {}
+_RATE_LIMIT  = 15          # max requests per window
+_RATE_WINDOW = 60          # seconds
+
+def _is_rate_limited(session_id: str) -> bool:
+    now  = time.time()
+    hits = [t for t in _rate_store.get(session_id, []) if now - t < _RATE_WINDOW]
+    if len(hits) >= _RATE_LIMIT:
+        return True
+    hits.append(now)
+    _rate_store[session_id] = hits
+    # Prune old sessions to avoid unbounded growth
+    if len(_rate_store) > 5000:
+        cutoff = now - _RATE_WINDOW
+        for sid in [k for k, v in _rate_store.items() if not v or v[-1] < cutoff]:
+            _rate_store.pop(sid, None)
+    return False
+
+
 @app.post("/api/chat")
 async def api_chat(request: Request):
     body       = await request.json()
@@ -477,6 +499,14 @@ async def api_chat(request: Request):
         return JSONResponse({"error": "message required"}, status_code=400)
     if agent not in ("hubspot", "zoho_crm", "both"):
         return JSONResponse({"error": f"unknown agent: {agent}"}, status_code=400)
+    if len(message) > 4000:
+        return JSONResponse({"error": "message too long (max 4000 chars)"}, status_code=400)
+    if _is_rate_limited(session_id):
+        log("warn", f"rate limit hit: session={session_id[:8]}")
+        return JSONResponse(
+            {"error": "rate_limit", "detail": "Too many requests — please wait a moment."},
+            status_code=429,
+        )
     return StreamingResponse(
         _stream_agent(message, history, agent, session_id=session_id),
         media_type="text/event-stream",

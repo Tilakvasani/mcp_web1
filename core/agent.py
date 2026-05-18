@@ -39,7 +39,7 @@ def get_llm() -> AzureChatOpenAI:
         api_key          = api_key,
         api_version      = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
         temperature      = 0.1,
-        max_tokens       = 8000,
+        max_tokens       = 2500,
     )
 
 
@@ -475,7 +475,7 @@ async def run_agent(
 
     result = await react_agent.ainvoke(
         {"messages": lc_messages},
-        config={"recursion_limit": 50},
+        config={"recursion_limit": 20},
     )
     return _extract_final_text(result)
 
@@ -515,6 +515,6 @@ async def run_agent_both(
 
     result = await react_agent.ainvoke(
         {"messages": lc_messages},
-        config={"recursion_limit": 50},
+        config={"recursion_limit": 20},
     )
     return _extract_final_text(result)

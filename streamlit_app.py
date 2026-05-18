@@ -111,6 +111,13 @@ def api_stream_chat(message: str, history: list, agent: str):
             stream=True, timeout=120,
             headers={"Accept": "text/event-stream"},
         ) as resp:
+            # Handle non-streaming error responses (429, 400, 500)
+            if resp.status_code == 429:
+                yield "\n\n⏳ **Rate limit reached** — you're sending messages too quickly. Please wait a moment and try again."
+                return
+            if resp.status_code >= 400:
+                yield f"\n\n❌ **Backend error {resp.status_code}** — please try again."
+                return
             buffer = ""
             for raw in resp.iter_content(chunk_size=None):
                 buffer += raw.decode("utf-8", errors="replace")
@@ -364,6 +371,14 @@ def _chat():
 
 
 def _send(text: str):
+    # Guard: strip and enforce max length before hitting backend
+    text = text.strip()
+    if not text:
+        return
+    if len(text) > 4000:
+        st.warning("⚠️ Message too long — please keep it under 4,000 characters.")
+        return
+
     agent = st.session_state.active_agent
     cfg   = AGENTS[agent]
 
