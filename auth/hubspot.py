@@ -15,17 +15,19 @@ Flow:
   6. Persist tokens; auto-refresh when expired
 """
 
-import os, json, time, base64, hashlib, secrets
+import json, time, base64, hashlib, secrets
 from pathlib import Path
 from urllib.parse import urlencode
+# pyrefly: ignore [missing-import]
 import httpx
-import httpx as _httpx_async  # used for async calls in check_is_admin
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
+from config.settings import HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, HUBSPOT_REDIRECT_URI
 
 load_dotenv()
 
-TOKEN_FILE   = Path(__file__).parent / ".hubspot_tokens.json"
-REDIRECT_URI = os.getenv("HUBSPOT_REDIRECT_URI", "http://localhost:8000/oauth/callback")
+TOKEN_FILE   = Path(__file__).parent.parent / ".hubspot_tokens.json"
+REDIRECT_URI = HUBSPOT_REDIRECT_URI
 
 # OAuth 2.1 metadata discovery — avoids hardcoding regional endpoints
 OAUTH_DISCOVERY_URL = "https://mcp.hubspot.com/.well-known/oauth-authorization-server"
@@ -82,7 +84,7 @@ def build_auth_url(code_challenge: str, state: str) -> str:
     configuration and the user's grant at install time (per HubSpot MCP docs).
     """
     params = {
-        "client_id":             os.getenv("HUBSPOT_CLIENT_ID", ""),
+        "client_id":             HUBSPOT_CLIENT_ID,
         "redirect_uri":          REDIRECT_URI,
         "state":                 state,
         "code_challenge":        code_challenge,
@@ -98,8 +100,8 @@ def exchange_code_for_tokens(code: str, code_verifier: str) -> dict:
     """
     r = httpx.post(TOKEN_URL, data={
         "grant_type":    "authorization_code",
-        "client_id":     os.getenv("HUBSPOT_CLIENT_ID", ""),
-        "client_secret": os.getenv("HUBSPOT_CLIENT_SECRET", ""),
+        "client_id":     HUBSPOT_CLIENT_ID,
+        "client_secret": HUBSPOT_CLIENT_SECRET,
         "redirect_uri":  REDIRECT_URI,
         "code":          code,
         "code_verifier": code_verifier,
@@ -140,8 +142,8 @@ def _is_expired(tokens: dict) -> bool:
 def _refresh(tokens: dict) -> dict:
     r = httpx.post(TOKEN_URL, data={
         "grant_type":    "refresh_token",
-        "client_id":     os.getenv("HUBSPOT_CLIENT_ID", ""),
-        "client_secret": os.getenv("HUBSPOT_CLIENT_SECRET", ""),
+        "client_id":     HUBSPOT_CLIENT_ID,
+        "client_secret": HUBSPOT_CLIENT_SECRET,
         "refresh_token": tokens["refresh_token"],
     }, timeout=15)
     r.raise_for_status()
@@ -236,3 +238,7 @@ async def check_is_admin(access_token: str, user_id: int) -> bool:
     except Exception:
         pass
     return False
+
+# Alias for routes.py compatibility
+def get_granted_scopes() -> list[str]:
+    return get_token_scopes()

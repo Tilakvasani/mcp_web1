@@ -23,7 +23,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 
-from crm_logger import log
+from core.logger import log
 from core.tools import get_langchain_tools
 
 
@@ -197,7 +197,10 @@ class SessionToolCache:
             reason = "MISS"
         log("cache", f"{reason} session={session_id[:8]} agent={agent} — loading tools…")
 
-        tools = await get_langchain_tools(crm_clients, granted_scopes=granted_scopes or [])
+        tools = []
+        for client in crm_clients.values():
+            client_tools = await get_langchain_tools(client, granted_scopes=granted_scopes or [])
+            tools.extend(client_tools)
 
         async with self._lock:
             self._cache[session_id] = _CacheEntry(

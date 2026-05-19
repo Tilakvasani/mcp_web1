@@ -33,12 +33,15 @@ import json
 import logging
 from typing import Any, Optional
 
+# pyrefly: ignore [missing-import]
 from pydantic import create_model, Field
+# pyrefly: ignore [missing-import]
 from langchain_core.tools import StructuredTool
+# pyrefly: ignore [missing-import]
 from mcp.types import TextContent
 
-from mcp_client import MCPClient
-from crm_logger import log
+from mcp_bridge.client import MCPClient
+from core.logger import log
 
 # Silence the old verbose mcp_tools logger — we use crm_logger instead
 _mcp_logger = logging.getLogger("mcp_tools")
@@ -633,17 +636,16 @@ def _wrap_mcp_tool(
 # Public API
 # ---------------------------------------------------------------------------
 async def get_langchain_tools(
-    clients: dict[str, MCPClient],
+    client: MCPClient,
     granted_scopes: list[str] | None = None,
 ) -> list[StructuredTool]:
     """
-    Connect to every MCP client, list their tools, and return them all
+    Connect to an MCP client, list its tools, and return them all
     as LangChain StructuredTool objects — each guarded by dynamic scope checks.
     """
     scope_set = set(granted_scopes or [])
     tools: list[StructuredTool] = []
-    for client in clients.values():
-        mcp_tools = await client.list_tools()
-        for mcp_tool in mcp_tools:
-            tools.append(_wrap_mcp_tool(mcp_tool, client, scope_set))
+    mcp_tools = await client.list_tools()
+    for mcp_tool in mcp_tools:
+        tools.append(_wrap_mcp_tool(mcp_tool, client, scope_set))
     return tools

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+streamlit
+langchain
+langchain-openai
+langgraph
+mcp
+httpx
+python-dotenv
+pydantic
