@@ -36,11 +36,22 @@ def _build_system_prompt(hs_tools: list, zp_tools: list) -> str:
         f"  [ZohoPeople] {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:120]}"
         for t in zp_tools
     )
+    
+    call_api_section = ""
+    has_call_api = any(getattr(t, "name", "") == "ZohoPeople_callAPI" for t in zp_tools)
+    if has_call_api:
+        call_api_section = """
+## ZohoPeople_callAPI — Dynamic REST API Tool
+To fetch ALL records of a form (e.g. employees, leave, attendance), use ZohoPeople_callAPI with the endpoint `/forms/{formName}/getRecords` and optional search params.
+Example: `GET /forms/employee/getRecords`
+"""
+
     return f"""You are a cross-system business intelligence assistant with access to both HubSpot CRM and Zoho People HRMS.
 
 ## Your Job
 Answer queries that need data from both systems. Call both systems, then merge into ONE unified answer.
 Never ask the user for IDs or clarification — figure it out from the tools.
+{call_api_section}
 
 ## HubSpot Tools ({len(hs_tools)})
 {hs_lines}

@@ -1,14 +1,14 @@
 """
 agents/hubspot_agent.py
 =======================
-HubSpot CRM agent — smart prompt + LangGraph ReAct runner.
+HubSpot CRM agent — Custom JSON Execution Loop.
 """
 
 from __future__ import annotations
 import os
+import json
 from langchain_openai        import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langgraph.prebuilt      import create_react_agent
 from crm_logger import log
 
 _MAX_TOKENS_SIMPLE  = 1200
@@ -36,10 +36,13 @@ def _get_llm(message: str) -> AzureChatOpenAI:
 
 
 def build_system_prompt(tools: list, scopes: list[str], is_admin: bool) -> str:
-    tool_lines = "\n".join(
-        f"  • {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:140]}"
-        for t in tools
-    )
+    tool_lines = []
+    for t in tools:
+        schema = t.args_schema.schema() if t.args_schema else {}
+        props = schema.get("properties", {})
+        tool_lines.append(f"  • {t.name}: {t.description}\n    Arguments Schema: {json.dumps(props)}")
+    tool_str = "\n".join(tool_lines)
+
     scope_str  = ", ".join(scopes[:12]) + ("…" if len(scopes) > 12 else "")
     admin_note = "Super Admin — all operations permitted." if is_admin else "Standard User."
 
@@ -49,7 +52,7 @@ def build_system_prompt(tools: list, scopes: list[str], is_admin: bool) -> str:
 Translate natural language CRM queries into the correct tool calls — immediately, without asking for IDs or clarification.
 
 ## Available Tools ({len(tools)})
-{tool_lines}
+{tool_str}
 
 ## Session Info
 - Permission level : {admin_note}
@@ -74,6 +77,11 @@ Translate natural language CRM queries into the correct tool calls — immediate
 | "who owns [deal/contact]" | Fetch the record and return the hubspot_owner_id resolved to name |
 | "create deal [name]" | Create a new deal — ask only for missing required fields |
 
+## Tool Usage: Custom JSON Format
+When you need to use a tool, reply with exactly a JSON object like this:
+{{"tool": "manage_crm_objects", "arguments": {{"objectType": "tickets", "action": "create", "properties": {{"subject": "Issue title", "content": "Issue details"}}}}}}
+No extra text, no code blocks, only the JSON.
+
 ## Smart Defaults — USE THESE ALWAYS
 - "all deals/contacts/companies" = fetch the object list with NO filter — do NOT ask for an ID
 - "today" = use today's actual date in YYYY-MM-DD format
@@ -97,7 +105,7 @@ Translate natural language CRM queries into the correct tool calls — immediate
 ## Response Format
 - Deal lists: `| Deal Name | Stage | Amount | Close Date | Owner |`
 - Contact lists: `| Name | Email | Company | Last Activity |`
-- Ticket lists: `| Subject | Status | Priority | Owner | Created |`
+- Ticket lists: `| Ticket | Status | Priority | Owner | Created |`
 - Pipeline summary: `| Stage | # Deals | Total Value |`
 - Single record: bullet list of key fields
 """
@@ -125,13 +133,52 @@ async def run_hubspot_agent(
             messages.append(AIMessage(content=content))
     messages.append(HumanMessage(content=message))
 
-    agent  = create_react_agent(llm, tools)
-    result = await agent.ainvoke(
-        {"messages": messages},
-        config={"recursion_limit": _RECURSION_LIMIT},
-    )
+    # Custom Execution Loop
+    for _ in range(_RECURSION_LIMIT):
+        response = await llm.ainvoke(messages)
+        content = str(response.content).strip()
+        
+        # Clean markdown formatting if present
+        clean_content = content
+        if clean_content.startswith("```json"):
+            clean_content = clean_content[7:]
+        if clean_content.startswith("```"):
+            clean_content = clean_content[3:]
+        if clean_content.endswith("```"):
+            clean_content = clean_content[:-3]
+        clean_content = clean_content.strip()
 
-    final = result["messages"][-1]
-    text  = getattr(final, "content", str(final))
-    log("ai", f"HubSpot agent → {len(text)} chars")
-    return text
+        # Try to parse it as a tool call
+        try:
+            parsed = json.loads(clean_content)
+            if isinstance(parsed, dict) and "tool" in parsed and "arguments" in parsed:
+                tool_name = parsed["tool"]
+                arguments = parsed["arguments"]
+                
+                # Find tool
+                tool = next((t for t in tools if t.name == tool_name), None)
+                if not tool:
+                    tool_result = f"Error: Tool {tool_name} not found."
+                else:
+                    try:
+                        if tool.coroutine:
+                            tool_result = await tool.coroutine(**arguments)
+                        else:
+                            tool_result = tool.func(**arguments)
+                        tool_result = str(tool_result)
+                    except Exception as e:
+                        tool_result = f"Tool execution failed: {e}"
+
+                # Append tool call and result to history
+                messages.append(AIMessage(content=content))
+                messages.append(HumanMessage(content=f"Tool {tool_name} returned:\n{tool_result}"))
+                continue
+        except json.JSONDecodeError:
+            pass  # It's not our JSON tool call format, so it's the final answer
+
+        # Final answer or non-tool response
+        log("ai", f"HubSpot agent → {len(content)} chars")
+        return content
+
+    log("ai", "HubSpot agent → recursion limit reached")
+    return "Agent stopped due to recursion limit."

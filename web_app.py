@@ -130,7 +130,7 @@ class _Cached:
 
 class MCPPool:
     MAX_AGE    = 600
-    PING_EVERY = 600      # Zoho MCP drops idle streams fast — ping every 5s
+    PING_EVERY = 600     # MCP servers drop idle streams fast — ping every 5s
 
     def __init__(self):
         self._pool = {}

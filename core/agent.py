@@ -113,6 +113,12 @@ async def run_agent(
             agent_key = rag_key,
             all_tools = all_tools,
         )
+
+        # Force-inject ZohoPeople_callAPI if it exists in zp_tools
+        call_api_tool = next((t for t in zp_tools if getattr(t, "name", "") == "ZohoPeople_callAPI"), None)
+        if call_api_tool and call_api_tool not in relevant_tools:
+            relevant_tools.append(call_api_tool)
+            
         log("ai", f"hybrid -> {len(relevant_tools)}/{len(all_tools)} tools selected")
     else:
         relevant_tools = []
