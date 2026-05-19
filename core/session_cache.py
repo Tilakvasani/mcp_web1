@@ -1,251 +1,163 @@
 """
-Session-based Tool Cache
-========================
-Loads all MCP tools ONCE per session, then filters to relevant tools
-per message using intent detection. Evicts automatically after TTL.
+core/session_cache.py
+=====================
+Session-level tool cache.
 
-Usage
------
-  cache = SessionToolCache()
+Loads ALL tools from an MCP client ONCE per session (not per request).
+TTL = 10 minutes. Stale or disconnected clients evict automatically.
 
-  # On each chat message:
-  tools = await cache.get_or_load(session_id, agent, crm_clients, scopes)
-  filtered = cache.filter_for_message(message, tools)
-
-  # When session ends (user disconnects / logout):
-  cache.evict(session_id)
-
-  # Background: stale sessions auto-evict after SESSION_TTL seconds of inactivity.
+Structure:
+  _CACHE[session_id][agent_key] = SessionEntry(tools, loaded_at)
 """
 
+from __future__ import annotations
 import time
 import asyncio
-import re
 from dataclasses import dataclass, field
-
 from crm_logger import log
-from core.tools import get_langchain_tools
 
+_TTL = 600  # 10 minutes
 
-# =============================================================================
-# Config
-# =============================================================================
-
-SESSION_TTL = 600   # seconds of inactivity before auto-evict (10 min)
-
-
-# =============================================================================
-# Intent → module keyword map
-# =============================================================================
-# Keys are words the user might write. Values are substrings that must appear
-# in the tool name for the tool to be included.
-# Order matters: more specific entries first.
-
-_INTENT_MAP: list[tuple[list[str], list[str]]] = [
-    # keywords in user message        → tool name substrings to keep
-    (["lead", "laed"],                 ["Lead"]),
-    (["deal", "opportunity", "dael"],  ["Deal"]),
-    (["account", "company"],           ["Account"]),
-    (["contact", "coantact", "contct"],["Contact"]),
-    (["convert"],                      ["Lead", "Contact", "Account", "Deal", "convert"]),
-    (["workflow"],                     ["Workflow", "workflow"]),
-    (["email"],                        ["Email", "email"]),
-    (["territory"],                    ["Territory"]),
-    (["blueprint"],                    ["Blueprint"]),
-    (["connection"],                   ["Connection"]),
-    (["configuration", "config"],      ["Configuration"]),
-]
-
-# Collect ALL module substrings from the intent map — used to detect generic tools dynamically
-_ALL_MODULE_SUBSTRINGS: list[str] = []
-for _, modules in _INTENT_MAP:
-    _ALL_MODULE_SUBSTRINGS.extend(modules)
-_ALL_MODULE_SUBSTRINGS = list(set(_ALL_MODULE_SUBSTRINGS))  # dedupe
-
-
-def _is_generic_tool(tool_name: str) -> bool:
-    """
-    A tool is 'generic' if its name doesn't contain ANY module-specific substring
-    from the intent map. Generic tools (like HubSpot's manage_crm_objects,
-    search_crm_objects, get_properties) work across all object types via parameters
-    and must always be included regardless of intent filtering.
-    """
-    return not any(mod in tool_name for mod in _ALL_MODULE_SUBSTRINGS)
-
-
-def filter_tools_by_intent(message: str, tools: list) -> list:
-    """
-    Given a user message and the full tool list, return only the tools
-    relevant to the detected intent.
-
-    Generic/utility tools (names that don't contain any module keyword) are
-    always included — they handle all object types via parameters.
-
-    Falls back to ALL tools if no intent is matched (safe default).
-    """
-    msg_lower = message.lower()
-
-    matched_modules: list[str] = []
-    for keywords, modules in _INTENT_MAP:
-        if any(kw in msg_lower for kw in keywords):
-            matched_modules.extend(modules)
-
-    # No match — return everything (safe fallback, happens on vague queries)
-    if not matched_modules:
-        log("cache", f"no intent match for '{message[:40]}' — using all {len(tools)} tools")
-        return tools
-
-    filtered = [
-        t for t in tools
-        if (
-            any(mod in t.name for mod in matched_modules)  # module-specific match
-            or _is_generic_tool(t.name)                    # generic/utility tool
-        )
-    ]
-
-    # Safety: if filter is too aggressive and leaves nothing, return all
-    if not filtered:
-        return tools
-
-    log("cache", f"intent filter '{message[:40]}' → {len(filtered)}/{len(tools)} tools")
-    return filtered
-
-
-# =============================================================================
-# Cache entry
-# =============================================================================
 
 @dataclass
-class _CacheEntry:
-    tools:      list
-    agent:      str
-    client_ids: frozenset = field(default_factory=frozenset)  # track which MCP clients built these tools
-    created_at: float = field(default_factory=time.time)
-    last_used:  float = field(default_factory=time.time)
-
-    def touch(self):
-        self.last_used = time.time()
+class _Entry:
+    tools     : list
+    loaded_at : float = field(default_factory=time.time)
 
     def is_stale(self) -> bool:
-        return (time.time() - self.last_used) > SESSION_TTL
-
-    def age(self) -> float:
-        return time.time() - self.created_at
+        return time.time() - self.loaded_at > _TTL
 
 
-# =============================================================================
-# SessionToolCache
-# =============================================================================
+# session_id → { agent_key → _Entry }
+_CACHE: dict[str, dict[str, _Entry]] = {}
+_LOCK  = asyncio.Lock()
 
-class SessionToolCache:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_or_load_tools(
+    session_id : str,
+    agent_key  : str,
+    client,            # MCPClient
+) -> list:
     """
-    Per-session tool cache. Thread-safe via asyncio.Lock.
-
-    - get_or_load()  : return cached tools or load fresh from MCP
-    - filter_for_message() : intent-based subset for a single message
-    - evict()        : explicit eviction (session end)
-    - evict_stale()  : TTL-based eviction (call from background task)
+    Return cached tools for (session_id, agent_key).
+    If not cached or stale, connect to MCP and load fresh tools.
     """
+    async with _LOCK:
+        session = _CACHE.setdefault(session_id, {})
+        entry   = session.get(agent_key)
 
-    def __init__(self):
-        self._cache: dict[str, _CacheEntry] = {}
-        self._lock  = asyncio.Lock()
-
-    @staticmethod
-    def _client_ids(crm_clients: dict) -> frozenset:
-        """Snapshot the identity of each MCP client so we detect reconnects."""
-        return frozenset(id(c) for c in crm_clients.values())
-
-    async def get_or_load(
-        self,
-        session_id: str,
-        agent: str,
-        crm_clients: dict,
-        granted_scopes: list[str] | None = None,
-    ) -> list:
-        """
-        Return cached tools for this session, or load them fresh if:
-          - session not in cache
-          - session cached a different agent
-          - cache entry is stale
-          - underlying MCP clients changed (pool reconnected after ClosedResourceError)
-        """
-        current_ids = self._client_ids(crm_clients)
-
-        async with self._lock:
-            entry = self._cache.get(session_id)
-
-        # Cache HIT — same agent, same clients, not stale
-        if (entry
-                and entry.agent == agent
-                and entry.client_ids == current_ids
-                and not entry.is_stale()):
-            entry.touch()
-            log("cache", f"HIT session={session_id[:8]} agent={agent} tools={len(entry.tools)}")
+        if entry and not entry.is_stale():
+            log("cache", f"tool cache HIT  session={session_id[:8]} agent={agent_key} ({len(entry.tools)} tools)")
             return entry.tools
 
-        # Cache MISS — determine reason for logging
-        if not entry:
-            reason = "MISS"
-        elif entry.is_stale():
-            reason = "STALE"
-        elif entry.agent != agent:
-            reason = "AGENT_CHANGE"
-        elif entry.client_ids != current_ids:
-            reason = "CLIENT_RECONNECT"
-        else:
-            reason = "MISS"
-        log("cache", f"{reason} session={session_id[:8]} agent={agent} — loading tools…")
+    # Outside lock — load tools (may be slow)
+    log("cache", f"tool cache MISS session={session_id[:8]} agent={agent_key} — loading…")
+    try:
+        raw_tools = await client.list_tools()
+    except Exception as e:
+        log("error", f"list_tools failed for {agent_key}: {e}")
+        return []
 
-        tools = await get_langchain_tools(crm_clients, granted_scopes=granted_scopes or [])
+    lc_tools = _to_langchain_tools(raw_tools, client)
 
-        async with self._lock:
-            self._cache[session_id] = _CacheEntry(
-                tools=tools, agent=agent, client_ids=current_ids,
+    async with _LOCK:
+        _CACHE.setdefault(session_id, {})[agent_key] = _Entry(tools=lc_tools)
+
+    log("ok", f"loaded {len(lc_tools)} tools for session={session_id[:8]} agent={agent_key}")
+    return lc_tools
+
+
+async def evict_session(session_id: str):
+    """Evict all tool cache entries for a session (on disconnect)."""
+    async with _LOCK:
+        _CACHE.pop(session_id, None)
+    log("cache", f"evicted session={session_id[:8]}")
+
+
+async def evict_stale_sessions():
+    """Periodic cleanup — remove sessions where all entries are stale."""
+    async with _LOCK:
+        stale_sessions = []
+        for sid, agents in _CACHE.items():
+            if all(e.is_stale() for e in agents.values()):
+                stale_sessions.append(sid)
+        for sid in stale_sessions:
+            del _CACHE[sid]
+    if stale_sessions:
+        log("cache", f"evicted {len(stale_sessions)} stale sessions")
+
+
+async def evict_all_sessions():
+    async with _LOCK:
+        count = len(_CACHE)
+        _CACHE.clear()
+    log("cache", f"evicted all {count} sessions")
+
+
+def get_cache_stats() -> dict:
+    total_tools = sum(
+        len(entry.tools)
+        for agents in _CACHE.values()
+        for entry in agents.values()
+    )
+    return {
+        "sessions"   : len(_CACHE),
+        "total_tools": total_tools,
+        "ttl_seconds": _TTL,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LangChain tool wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _to_langchain_tools(mcp_tools: list, client) -> list:
+    """Wrap raw MCP tool definitions as LangChain-compatible callable tools."""
+    from langchain_core.tools import StructuredTool
+    import json
+
+    lc_tools = []
+    for tool in mcp_tools:
+        name = getattr(tool, "name", "")
+        desc = getattr(tool, "description", "") or ""
+        schema = getattr(tool, "inputSchema", {}) or {}
+
+        async def _call(client=client, name=name, **kwargs) -> str:
+            try:
+                result = await client.call_tool(name, kwargs)
+                if result is None:
+                    return "No result returned."
+                content = getattr(result, "content", result)
+                if isinstance(content, list):
+                    parts = []
+                    for c in content:
+                        text = getattr(c, "text", None)
+                        if text:
+                            parts.append(text)
+                        elif isinstance(c, dict):
+                            parts.append(json.dumps(c))
+                    return "\n".join(parts) if parts else str(content)
+                return str(content)
+            except Exception as e:
+                return f"Tool error: {e}"
+
+        # Build args_schema from inputSchema if available
+        props    = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        try:
+            lc_tool = StructuredTool.from_function(
+                coroutine    = _call,
+                name         = name,
+                description  = desc,
+                infer_schema = not bool(props),
             )
+            lc_tools.append(lc_tool)
+        except Exception as e:
+            log("warn", f"could not wrap tool {name}: {e}")
 
-        log("cache", f"STORED session={session_id[:8]} — {len(tools)} tools cached")
-        return tools
-
-    def filter_for_message(self, message: str, tools: list) -> list:
-        """Intent-filter a tool list for a single message. Stateless."""
-        return filter_tools_by_intent(message, tools)
-
-    async def evict(self, session_id: str):
-        """Explicitly remove a session (call on disconnect / logout)."""
-        async with self._lock:
-            entry = self._cache.pop(session_id, None)
-        if entry:
-            log("cache", f"EVICT session={session_id[:8]} (age {entry.age():.0f}s)")
-
-    async def evict_stale(self):
-        """Remove all sessions that have exceeded SESSION_TTL. Call periodically."""
-        async with self._lock:
-            stale = [sid for sid, e in self._cache.items() if e.is_stale()]
-            for sid in stale:
-                del self._cache[sid]
-        if stale:
-            log("cache", f"TTL evicted {len(stale)} stale session(s)")
-
-    async def evict_all(self):
-        """Remove ALL cached sessions. Call on disconnect/account switch."""
-        async with self._lock:
-            count = len(self._cache)
-            self._cache.clear()
-        if count:
-            log("cache", f"evicted ALL {count} session(s) (account switch)")
-
-    def stats(self) -> dict:
-        return {
-            "sessions": len(self._cache),
-            "entries": [
-                {
-                    "session": sid[:8],
-                    "agent":   e.agent,
-                    "tools":   len(e.tools),
-                    "age_s":   round(e.age()),
-                    "idle_s":  round(time.time() - e.last_used),
-                }
-                for sid, e in self._cache.items()
-            ],
-        }
+    return lc_tools

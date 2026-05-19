@@ -1,23 +1,38 @@
 [project]
-name = "app"
-version = "0.2.0"
-description = "HubSpot CRM Agent — LangChain + LangGraph + FastAPI + HubSpot MCP OAuth"
-readme = "README.md"
+name        = "ai-assistant"
+version     = "2.0.0"
+description = "AI Business Assistant — HubSpot CRM + Zoho People HRMS with RAG tool selection"
+readme      = "README.md"
 requires-python = ">=3.10"
+
 dependencies = [
-    # LangChain stack
+    # LangChain / LangGraph
     "langchain>=0.3.0",
     "langchain-openai>=0.2.0",
     "langchain-core>=0.3.0",
     "langgraph>=0.2.0",
+
     # MCP client
     "mcp[cli]>=1.8.0",
+
     # Web
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
+
     # HTTP + env
     "httpx>=0.27.0",
     "python-dotenv>=1.1.0",
+
+    # ── RAG stack ────────────────────────────────────────────────────────────
+    # Chroma — local vector DB (no cloud, no account needed)
+    "chromadb>=0.5.0",
+
+    # Azure OpenAI SDK — embeddings + chat (one package covers both)
+    "openai>=1.30.0",
+
+    # Streamlit
+    "streamlit>=1.35.0",
+    "requests>=2.31.0",
 ]
 
 [tool.uv]

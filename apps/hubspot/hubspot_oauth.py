@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN_FILE   = Path(__file__).parent / ".hubspot_tokens.json"
+TOKEN_FILE   = Path(__file__).parent.parent.parent / ".hubspot_tokens.json"
 REDIRECT_URI = os.getenv("HUBSPOT_REDIRECT_URI", "http://localhost:8000/oauth/callback")
 
 # OAuth 2.1 metadata discovery — avoids hardcoding regional endpoints

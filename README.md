@@ -1,131 +1,100 @@
-# Multi-CRM AI Agent — LangChain + LangGraph
+# AI Business Assistant
 
-> **⚠️ Security & Multi-User Notice**
->
-> - This app stores **one OAuth token per CRM** in local files (`.zoho_tokens.json`, `.hubspot_tokens.json`).
->   If multiple users connect, each new login **overwrites** the previous user's token.
->   This is a **single-user-per-CRM** app by design. Do not expose it publicly without adding per-user token isolation.
-> - **Never commit `.env`, `.zoho_tokens.json`, or `.hubspot_tokens.json`** to version control.
->   All three contain live credentials. They are in `.gitignore` — keep them there.
-> - Rate limiting: `/api/chat` allows **15 requests per 60 seconds** per session.
+One chat interface → HubSpot CRM + Zoho People HRMS + Cross-system queries.
 
+**Stack:** FastAPI · Streamlit · LangGraph · ChromaDB · Azure OpenAI · MCP
 
-A FastAPI web app that connects to **HubSpot** and/or **Zoho CRM** via MCP
-using **LangGraph's ReAct agent** and Azure OpenAI.
+---
 
-## Stack
+## Quick Start
 
-| Layer | Technology |
-|-------|-----------|
-| LLM | Azure OpenAI (`AzureChatOpenAI`) |
-| Agent | LangGraph `create_react_agent` |
-| Tools | LangChain `StructuredTool` wrapping CRM MCP servers |
-| MCP Transport | Streamable HTTP (`mcp >= 1.8`) |
-| Auth | HubSpot OAuth 2.1 PKCE + Zoho OAuth |
-| Web | FastAPI + SSE streaming |
+```bash
+# 1. Install dependencies
+pip install -e .
+# or
+uv sync
 
-## File Structure
+# 2. Copy and fill environment variables
+cp .env.example .env
 
-```
-mcp_web/
-├── web_app.py          # FastAPI app — OAuth routes + SSE chat endpoint
-├── mcp_client.py       # MCP client for remote MCP servers
-├── hubspot_oauth.py    # HubSpot OAuth 2.1 PKCE flow helpers
-├── zoho_auth.py        # Zoho OAuth helpers
-├── crm_logger.py       # Compact structured logger
-├── pyproject.toml      # Dependencies
-├── .env                # Secrets (never commit)
-└── core/
-    ├── agent.py        # LangGraph ReAct agent + system prompt (v2)
-    └── tools.py        # MCP → LangChain StructuredTool bridge
+# 3. Start the backend
+uvicorn web_app:app --port 8000
+
+# 4. Start the frontend (new terminal)
+streamlit run streamlit_app.py
 ```
 
-## Setup
+Open http://localhost:8501
 
-1. Install dependencies:
-   ```bash
-   pip install -e .
-   # or with uv:
-   uv sync
-   ```
+---
 
-2. Fill in `.env` with your Azure OpenAI, HubSpot, and Zoho credentials.
+## What you need in Azure OpenAI
 
-3. Run:
-   ```bash
-   python web_app.py
-   # or
-   uvicorn web_app:app --host 0.0.0.0 --port 8000
-   ```
+Two deployments in Azure OpenAI Studio:
 
-4. Open http://localhost:8000 and connect your CRM via the sidebar.
+| Deployment | Model | Used for |
+|---|---|---|
+| `gpt-4o` (or your name) | GPT-4o / GPT-4.1 | Chat / reasoning |
+| `text-embedding-3-small` | text-embedding-3-small | RAG tool selection |
 
-## How It Works
+---
+
+## Connecting your apps
+
+**HubSpot** → Click "Connect HubSpot" in sidebar → OAuth flow → done.
+
+**Zoho People** → Go to [mcp.zoho.com](https://mcp.zoho.com) → copy your MCP URL → paste in sidebar → Save & Connect.
+
+---
+
+## How RAG tool selection works
+
+1. User sends a message
+2. Message embedded via Azure OpenAI (cached — same query = zero API cost)
+3. ChromaDB cosine similarity search on all indexed tools
+4. Keyword pre-filter re-ranks results
+5. Top 14 tools sent to LLM (not all 95+)
+
+**Tool indexing lifecycle:**
+- HubSpot connects → tools embedded + stored in ChromaDB
+- Zoho People connects → tools embedded + stored in ChromaDB
+- User disconnects / session ends → vectors deleted from ChromaDB
+
+---
+
+## File structure
 
 ```
-User message
-     │
-     ▼
-web_app.py  ──► core/agent.py  (_augment_message adds context hints)
-                    │
-                    ├── AzureChatOpenAI (LangChain)
-                    ├── create_react_agent (LangGraph)
-                    │       ↕ tool calls (automatic loop)
-                    └── core/tools.py
-                            └── MCPClient → HubSpot / Zoho MCP
-```
-
-## v2 Prompt Improvements (core/agent.py)
-
-### 1 — Demo / Test Data Handling
-When a user says *"create a demo lead"*, *"put anything you want"*,
-*"use test data"*, or *"you decide"*, the agent now:
-- Generates realistic sample data itself (name, email, company, phone).
-- Proceeds without asking the user for field values.
-- Reports back exactly what was created.
-
-### 2 — Confirmation Loop Fix
-- Confirmation is asked **once only** before create/update/delete.
-- If the user already said *"yes"* / *"do it"* / *"ok"* / *"sure"* in **any**
-  previous message, the agent proceeds immediately — no re-confirmation.
-- `_augment_message()` injects a `[SYSTEM CONTEXT]` hint into the current user
-  message so the LLM never forgets prior confirmations across turns.
-
-### 3 — Casual Language & Typo Handling
-A lookup table in the system prompt maps informal phrases and common typos
-to correct intents:
-- *"craete"*, *"mak"*, *"lisain"* → create / list intent
-- *"ya"*, *"ok bro"*, *"just do it"* → confirmed
-
-### 4 — Field Discovery Workflow
-Before any create/update the agent is instructed to:
-1. Call the CRM's fields/modules tool to get exact API field names.
-2. Use only those field names — never guess.
-3. Retry once with corrections on FORMAT_ERROR, then report and stop.
-
-### 5 — Human-Readable Permission Errors
-PERMISSION_DENIED responses are surfaced as:
-> ❌ I don't have permission to [action]. Your CRM token is missing the
-> required scope: [scope]. Please reconnect with the correct permissions.
-
-### 6 — Loop Prevention Tightened
-- Max 2 attempts per action before stopping and reporting.
-- NEVER retries a tool with identical arguments.
-
-## Environment Variables
-
-```env
-AZURE_OPENAI_DEPLOYMENT_NAME=...
-AZURE_OPENAI_ENDPOINT=https://...
-AZURE_OPENAI_API_KEY=...
-AZURE_OPENAI_API_VERSION=2024-02-01
-
-HUBSPOT_CLIENT_ID=...
-HUBSPOT_CLIENT_SECRET=...
-HUBSPOT_MCP_URL=https://mcp.hubspot.com/
-
-ZOHO_CLIENT_ID=...
-ZOHO_CLIENT_SECRET=...
-
-STREAMLIT_URL=http://localhost:8501
+ai-assistant/
+├── rag/
+│   ├── embeddings.py        Azure OpenAI embeddings + query cache
+│   ├── chroma_store.py      ChromaDB wrapper (one collection per session)
+│   ├── hybrid_search.py     Keyword pre-filter + vector similarity
+│   └── tool_indexer.py      Index on connect, deindex on disconnect
+│
+├── core/
+│   ├── agent.py             Central dispatcher (pre-router → cache → RAG → LLM)
+│   ├── session_cache.py     MCP tool cache (once per session, TTL 10 min)
+│   ├── response_cache.py    In-memory response cache (TTL 5 min)
+│   ├── pre_router.py        Instant replies for greetings/help/off-topic
+│   └── tools.py             HubSpot scope guards
+│
+├── agents/
+│   ├── hubspot_agent.py     HubSpot CRM LangGraph agent
+│   ├── zoho_people_agent.py Zoho People HRMS LangGraph agent
+│   └── cross_agent.py       Cross-system combined agent
+│
+├── apps/
+│   ├── hubspot/
+│   │   └── hubspot_oauth.py HubSpot OAuth 2.1 + PKCE
+│   └── zoho_people/
+│       └── zoho_people_auth.py Zoho People MCP URL manager
+│
+├── chroma_data/             Local ChromaDB storage (gitignored)
+├── web_app.py               FastAPI backend
+├── streamlit_app.py         Streamlit frontend
+├── mcp_client.py            MCP client (unchanged)
+├── crm_logger.py            Logger (unchanged)
+├── pyproject.toml
+└── .env.example
 ```

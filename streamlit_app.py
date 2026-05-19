@@ -1,9 +1,7 @@
 """
-Multi-CRM AI Agent — Streamlit Frontend
-=========================================
-Run both servers:
-    uvicorn web_app:app --port 8000
-    streamlit run streamlit_app.py
+Streamlit Frontend — AI Business Assistant
+==========================================
+Tabs: HubSpot CRM · Zoho People HRMS · Cross-System
 """
 
 import json
@@ -16,7 +14,7 @@ suppress_noisy_libs()
 BACKEND = "http://localhost:8000"
 
 st.set_page_config(
-    page_title="Multi-CRM AI Agent",
+    page_title="AI Business Assistant",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -31,14 +29,13 @@ st.markdown("""
 
 # ── Session state ──────────────────────────────────────────────────────────
 _DEFAULTS = {
-    "messages":          [],
-    "active_agent":      "hubspot",
-    "active_tab":        "chat",
-    "prefill":           "",
-    "session_id":        str(uuid.uuid4()),
-    "messages_hubspot":  [],
-    "messages_zoho_crm": [],
-    "messages_both":     [],
+    "session_id"       : str(uuid.uuid4()),
+    "active_agent"     : "hubspot",
+    "active_tab"       : "chat",
+    "prefill"          : "",
+    "messages_hubspot" : [],
+    "messages_zoho_people": [],
+    "messages_cross"   : [],
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -47,37 +44,49 @@ for k, v in _DEFAULTS.items():
 # ── Agent configs ──────────────────────────────────────────────────────────
 AGENTS = {
     "hubspot": {
-        "label": "HubSpot", "icon": "🟠",
+        "label"      : "HubSpot CRM",
+        "icon"       : "🟠",
         "placeholder": "Ask anything about your HubSpot CRM…",
-        "prompts": [
-            ("📊 Pipeline overview",  "Summarise my HubSpot deal pipeline by stage"),
-            ("💼 Open deals",         "Show all open deals sorted by amount"),
-            ("🔍 Find a contact",     "Find contact john@acme.com"),
-            ("➕ Create a deal",      "Create a new deal for Acme Corp worth $50,000"),
-            ("📋 Recent activity",    "Show CRM activities from the last 7 days"),
-            ("✅ Closed won",         "List all deals closed won this quarter"),
+        "color"      : "#E85D30",
+        "prompts"    : [
+            ("📊 Pipeline overview",   "Summarise my HubSpot deal pipeline by stage"),
+            ("💼 Open deals",          "Show all open deals sorted by close date"),
+            ("🔍 Find a contact",      "Find contact john@acme.com"),
+            ("🎫 Unresolved tickets",  "Show all unresolved support tickets"),
+            ("🏢 Top companies",       "List top 10 companies by deal value"),
+            ("✅ Closed won",          "List all deals closed won this quarter"),
+            ("📋 Tasks due today",     "Show all tasks due today"),
+            ("📧 Recent emails",       "Show emails sent in the last 7 days"),
         ],
     },
-    "zoho_crm": {
-        "label": "Zoho CRM", "icon": "🔵",
-        "placeholder": "Ask anything about your Zoho CRM…",
-        "prompts": [
-            ("🏆 All leads",     "Show me all leads in Zoho CRM"),
-            ("👤 All contacts",  "List all contacts with email and phone"),
-            ("💰 Open deals",    "Show all deals in the pipeline"),
-            ("🏢 All accounts",  "Show me all accounts"),
-            ("🔄 Convert lead",  "Help me convert a lead to a contact"),
-            ("📊 All modules",   "List all available Zoho CRM modules"),
+    "zoho_people": {
+        "label"      : "Zoho People HRMS",
+        "icon"       : "🟢",
+        "placeholder": "Ask anything about HR, employees, or attendance…",
+        "color"      : "#1D9E75",
+        "prompts"    : [
+            ("👥 All employees",       "List all active employees with their department"),
+            ("🏖️  On leave today",    "Who is on leave today?"),
+            ("📅 Attendance",          "Show attendance records for this week"),
+            ("🏢 Departments",         "List all departments with headcount"),
+            ("📝 Pending leave",       "Show all pending leave requests"),
+            ("🕐 Late arrivals",       "Who checked in late today?"),
+            ("👤 Employee profile",    "Show profile for Rahul Mehta"),
+            ("📊 Leave summary",       "Give me a leave summary for this month"),
         ],
     },
-    "both": {
-        "label": "Both CRMs", "icon": "⚡",
-        "placeholder": "Query both HubSpot and Zoho CRM simultaneously…",
-        "prompts": [
-            ("💰 All deals (both)",    "Show me all open deals from both CRMs"),
-            ("👤 All contacts (both)", "Show all contacts from both CRMs"),
-            ("📊 Compare pipelines",   "Compare pipelines from HubSpot and Zoho"),
-            ("🏆 All leads (both)",    "Show all leads from both CRMs"),
+    "cross": {
+        "label"      : "Cross-System",
+        "icon"       : "⚡",
+        "placeholder": "Query HubSpot + Zoho People together…",
+        "color"      : "#534AB7",
+        "prompts"    : [
+            ("🔗 Sales reps on leave", "Which sales reps are on leave today?"),
+            ("🎫 Absent + tickets",    "Show support tickets assigned to employees on leave"),
+            ("📊 Deals vs headcount",  "Compare active deals per department with headcount"),
+            ("👤 Contact → employee",  "Show the employee linked to client ABC Technologies"),
+            ("📅 Team availability",   "Which account managers are available this week?"),
+            ("🔄 Ownership gaps",      "Show open deals where the owner is currently absent"),
         ],
     },
 }
@@ -97,12 +106,14 @@ def api_stream_chat(message: str, history: list, agent: str):
     try:
         with requests.post(
             f"{BACKEND}/api/chat",
-            json={"message": message, "history": history, "agent": agent, "session_id": session_id},
-            stream=True, timeout=120,
-            headers={"Accept": "text/event-stream"},
+            json    = {"message": message, "history": history,
+                       "agent": agent, "session_id": session_id},
+            stream  = True,
+            timeout = 120,
+            headers = {"Accept": "text/event-stream"},
         ) as resp:
             if resp.status_code == 429:
-                yield "\n\n⏳ **Rate limit reached** — please wait a moment and try again."
+                yield "\n\n⏳ **Rate limit reached** — please wait a moment."
                 return
             if resp.status_code >= 400:
                 yield f"\n\n❌ **Backend error {resp.status_code}** — please try again."
@@ -116,13 +127,11 @@ def api_stream_chat(message: str, history: list, agent: str):
                         if line.startswith("data: "):
                             try:
                                 data = json.loads(line[6:])
-                                t = data.get("type")
+                                t    = data.get("type")
                                 if t == "chunk":
                                     yield data.get("text", "")
                                 elif t == "error":
-                                    err    = data.get("error", "")
-                                    detail = data.get("detail", "")
-                                    yield _fmt_error(err, detail, agent)
+                                    yield _fmt_error(data.get("error",""), data.get("detail",""), agent)
                                     return
                                 elif t == "done":
                                     return
@@ -134,13 +143,14 @@ def api_stream_chat(message: str, history: list, agent: str):
 
 def _fmt_error(error: str, detail: str, agent: str) -> str:
     msgs = {
-        "mcp_url_missing":    "🔗 Zoho MCP URL not set — add it in the sidebar.",
-        "preflight_failed":   f"🌐 Cannot reach MCP server. Detail: `{detail}`",
-        "hubspot_unavailable":"🔑 HubSpot not connected — click **Connect HubSpot**.",
-        "no_clients":         "⚠️ No CRM connected. Connect at least one from the sidebar.",
-        "content_filter":     "🛡️ Your request was flagged by content safety filters. Please rephrase.",
-        "rate_limit":         "⏳ Too many requests — please wait a moment and try again.",
-        "auth_error":         "🔑 AI service authentication failed. Check your API key.",
+        "mcp_url_missing"        : "🔗 MCP URL not set — add it in the sidebar.",
+        "preflight_failed"       : f"🌐 Cannot reach MCP server. Detail: `{detail}`",
+        "hubspot_unavailable"    : "🔑 HubSpot not connected — click **Connect HubSpot**.",
+        "zoho_people_mcp_url_missing": "🔗 Zoho People MCP URL not set — add it in the sidebar.",
+        "no_clients"             : "⚠️ No system connected. Connect from the sidebar first.",
+        "content_filter"         : "🛡️ Content safety filter triggered. Please rephrase.",
+        "rate_limit"             : "⏳ Too many requests — please wait a moment.",
+        "auth_error"             : "🔑 AI service auth failed. Check your API key.",
     }
     return f"\n\n{msgs.get(error, f'❌ {detail or error}')}"
 
@@ -152,55 +162,58 @@ def get_status() -> dict:
 
 def _handle_oauth_callback():
     p = st.query_params
-    if ok := p.get("oauth_ok", ""):
-        st.session_state["_ok"] = ok
+    if ok  := p.get("oauth_ok", ""):
+        st.session_state["_ok"]  = ok
         st.query_params.clear()
     elif err := p.get("oauth_error", ""):
         st.session_state["_err"] = err
         st.query_params.clear()
 
 
-def _get_messages_key(agent: str) -> str:
+def _msg_key(agent: str) -> str:
     return f"messages_{agent}"
 
+def _get_msgs() -> list:
+    return st.session_state.get(_msg_key(st.session_state.active_agent), [])
 
-def _get_messages() -> list:
-    key = _get_messages_key(st.session_state.active_agent)
-    return st.session_state.get(key, [])
-
-
-def _set_messages(msgs: list):
-    key = _get_messages_key(st.session_state.active_agent)
-    st.session_state[key] = msgs
+def _set_msgs(msgs: list):
+    st.session_state[_msg_key(st.session_state.active_agent)] = msgs
 
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
 def _sidebar(status: dict):
     with st.sidebar:
-        st.markdown("## 🤖 CRM Agent")
-        st.caption("FastAPI · Streamlit · MCP")
+        st.markdown("## 🤖 AI Assistant")
+        st.caption("HubSpot · Zoho People · Cross-System")
         st.divider()
 
-        st.markdown("**Active CRM**")
-        cols = st.columns(3)
-        for col, (ag, lbl) in zip(cols, [("hubspot","🟠 HS"),("zoho_crm","🔵 Zo"),("both","⚡")]):
+        # Agent selector
+        st.markdown("**Active Agent**")
+        agent_cols = st.columns(3)
+        for col, (ag, cfg) in zip(agent_cols, AGENTS.items()):
             with col:
                 active = st.session_state.active_agent == ag
-                if st.button(lbl, key=f"ag_{ag}", use_container_width=True,
-                              type="primary" if active else "secondary"):
+                if st.button(
+                    f"{cfg['icon']}",
+                    key              = f"ag_{ag}",
+                    use_container_width = True,
+                    type             = "primary" if active else "secondary",
+                    help             = cfg["label"],
+                ):
                     if ag != st.session_state.active_agent:
                         st.session_state.active_agent = ag
                         st.rerun()
 
+        agent_label = AGENTS[st.session_state.active_agent]["label"]
+        st.caption(f"Active: **{agent_label}**")
         st.divider()
 
         # ── HubSpot ──────────────────────────────────────────────────────────
-        hs_data = status.get("hubspot", {})
-        hs_ok   = hs_data.get("connected", False)
-        st.markdown("**HubSpot**")
-        if hs_ok:
-            st.success(f"✅ {hs_data.get('message','Connected')}")
+        hs = status.get("hubspot", {})
+        st.markdown("**🟠 HubSpot CRM**")
+        if hs.get("connected"):
+            st.success(f"✅ {hs.get('message','Connected')}")
             if st.button("🔌 Disconnect HubSpot", use_container_width=True):
                 api("/api/disconnect", method="POST")
                 st.cache_data.clear()
@@ -212,42 +225,43 @@ def _sidebar(status: dict):
 
         st.divider()
 
-        # ── Zoho CRM — MCP URL only, no OAuth ────────────────────────────────
-        zo_data = status.get("zoho", {})
-        zo_ok   = zo_data.get("connected", False)
-        st.markdown("**Zoho CRM**")
-        if zo_ok:
-            st.success("✅ Zoho MCP Connected")
-            if st.button("🔌 Disconnect Zoho", use_container_width=True):
-                api("/zoho/disconnect", method="POST")
+        # ── Zoho People ───────────────────────────────────────────────────────
+        zp = status.get("zoho_people", {})
+        st.markdown("**🟢 Zoho People HRMS**")
+        if zp.get("connected"):
+            st.success("✅ Zoho People Connected")
+            if st.button("🔌 Disconnect Zoho People", use_container_width=True):
+                api("/zoho-people/disconnect", method="POST")
                 st.cache_data.clear()
                 st.rerun()
         else:
             st.warning("Not connected")
-            st.caption("From [mcp.zoho.in](https://mcp.zoho.in) → Connection → copy your MCP URL")
+            st.caption("Get your MCP URL from [Zoho People MCP](https://mcp.zoho.com) → copy your URL")
             mcp_inp = st.text_input(
-                "Zoho MCP URL", label_visibility="collapsed", key="mcp_url_input",
-                placeholder="https://mcp.zoho.in/mcp-client/YOUR_ID/sse",
+                "Zoho People MCP URL",
+                label_visibility = "collapsed",
+                key              = "zp_mcp_url",
+                placeholder      = "https://mcp.zoho.com/people/YOUR_ID/sse",
             )
-            if st.button("💾 Save & Connect", use_container_width=True):
+            if st.button("💾 Save & Connect", key="zp_save", use_container_width=True):
                 if mcp_inp.strip():
-                    with st.spinner("Testing…"):
-                        r = api("/zoho/save-mcp-url", method="POST",
+                    with st.spinner("Testing connection…"):
+                        r = api("/zoho-people/save-mcp-url", method="POST",
                                 json={"url": mcp_inp.strip()})
                     if r.get("reachable"):
                         st.success("✅ Connected!")
                         st.cache_data.clear()
                         st.rerun()
                     else:
-                        st.warning("⚠️ Saved but: " + r.get("detail", ""))
+                        st.warning(f"⚠️ Saved but unreachable: {r.get('detail','')}")
                 else:
-                    st.error("Paste your Zoho MCP URL first.")
+                    st.error("Paste your Zoho People MCP URL first.")
 
         st.divider()
 
         # ── Navigation ────────────────────────────────────────────────────────
         st.markdown("**Navigation**")
-        for key, label in [("chat","💬 Chat"),("permissions","🔑 Permissions"),("debug","🛠️ Debug MCP")]:
+        for key, label in [("chat","💬 Chat"),("permissions","🔑 Permissions"),("debug","🛠️ Debug")]:
             t = "primary" if st.session_state.active_tab == key else "secondary"
             if st.button(label, key=f"nav_{key}", use_container_width=True, type=t):
                 st.session_state.active_tab = key
@@ -255,40 +269,42 @@ def _sidebar(status: dict):
 
         st.divider()
 
+        # ── Quick prompts ─────────────────────────────────────────────────────
         cfg = AGENTS[st.session_state.active_agent]
         st.markdown(f"**Quick · {cfg['icon']} {cfg['label']}**")
         for label, prompt in cfg["prompts"]:
-            if st.button(label, key=f"qcmd_{label}", use_container_width=True):
+            if st.button(label, key=f"qp_{label}", use_container_width=True):
                 st.session_state.prefill    = prompt
                 st.session_state.active_tab = "chat"
                 st.rerun()
 
         st.divider()
         if st.button("🗑️ Clear Chat", use_container_width=True):
-            _set_messages([])
+            _set_msgs([])
             st.session_state.prefill = ""
             st.rerun()
 
-        st.caption("Backend :8000 · Frontend :8501")
+        st.caption("Backend :8000  ·  Frontend :8501")
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
 
 def _header(status: dict):
     cfg   = AGENTS[st.session_state.active_agent]
-    hs_ok = status.get("hubspot", {}).get("connected", False)
-    zo_ok = status.get("zoho", {}).get("connected", False)
+    hs_ok = status.get("hubspot",      {}).get("connected", False)
+    zp_ok = status.get("zoho_people",  {}).get("connected", False)
 
     c1, c2 = st.columns([5, 3])
     with c1:
-        st.markdown(f"### {cfg['icon']} Multi-CRM AI Agent")
-        st.caption(f"LangGraph · MCP · FastAPI :8000 · Mode: **{cfg['label']}**")
+        st.markdown(f"### {cfg['icon']} AI Business Assistant")
+        st.caption(f"LangGraph · MCP · RAG · Mode: **{cfg['label']}**")
     with c2:
-        parts = []
-        parts.append("🟠 HubSpot ✅" if hs_ok else "🟠 HubSpot ○")
-        parts.append("🔵 Zoho ✅"    if zo_ok else "🔵 Zoho ○")
-        st.markdown("  ·  ".join(parts))
-        st.caption(f"{cfg['icon']} {cfg['label']} Mode active")
+        status_parts = [
+            "🟠 HubSpot ✅" if hs_ok else "🟠 HubSpot ○",
+            "🟢 Zoho People ✅" if zp_ok else "🟢 Zoho People ○",
+        ]
+        st.markdown("  ·  ".join(status_parts))
+        st.caption(f"{cfg['icon']} {cfg['label']} active")
     st.divider()
 
 
@@ -297,18 +313,16 @@ def _header(status: dict):
 def _chat():
     agent = st.session_state.active_agent
     cfg   = AGENTS[agent]
-    msgs  = _get_messages()
+    msgs  = _get_msgs()
 
     if not msgs:
-        st.markdown(f"#### {cfg['icon']} {cfg['label']} Agent ready")
-        st.markdown(
-            f"Your AI assistant for **{cfg['label']}**. "
-            "Ask about deals, contacts, companies, leads, and pipelines."
-        )
+        st.markdown(f"#### {cfg['icon']} {cfg['label']} — Ready")
+        if agent == "cross":
+            st.info("⚡ Cross-system mode queries both **HubSpot CRM** and **Zoho People HRMS** simultaneously.")
         st.markdown("**Try a quick action:**")
-        chip_cols = st.columns(3)
-        for i, (label, prompt) in enumerate(cfg["prompts"]):
-            with chip_cols[i % 3]:
+        cols = st.columns(4)
+        for i, (label, prompt) in enumerate(cfg["prompts"][:8]):
+            with cols[i % 4]:
                 if st.button(label, key=f"chip_{agent}_{i}", use_container_width=True):
                     st.session_state.prefill = prompt
                     st.rerun()
@@ -336,33 +350,28 @@ def _send(text: str):
     if not text:
         return
     if len(text) > 4000:
-        st.warning("⚠️ Message too long — please keep it under 4,000 characters.")
+        st.warning("⚠️ Message too long — max 4,000 characters.")
         return
 
     agent = st.session_state.active_agent
     cfg   = AGENTS[agent]
-
-    msgs = _get_messages()
-    msgs.append({"role": "user", "content": text, "agent": agent})
-    _set_messages(msgs)
+    msgs  = _get_msgs()
+    msgs.append({"role": "user", "content": text})
+    _set_msgs(msgs)
 
     with st.chat_message("user", avatar="👤"):
         st.markdown(text)
 
     history = [{"role": m["role"], "content": m["content"]} for m in msgs[:-1]]
 
-    import time as _time
-    _t0 = _time.time()
+    import time as _t
+    t0 = _t.time()
     with st.chat_message("assistant", avatar=cfg["icon"]):
         full = st.write_stream(api_stream_chat(text, history, agent))
-    _elapsed = _time.time() - _t0
+    elapsed = _t.time() - t0
 
-    msgs.append({
-        "role": "assistant",
-        "content": full or "⚠️ No response received.",
-        "agent": agent,
-    })
-    _set_messages(msgs)
+    msgs.append({"role": "assistant", "content": full or "⚠️ No response received."})
+    _set_msgs(msgs)
 
 
 # ── Permissions tab ──────────────────────────────────────────────────────────
@@ -370,16 +379,12 @@ def _send(text: str):
 def _permissions(status: dict):
     st.markdown("### 🔑 HubSpot Permissions")
     st.caption("Live data from `/api/permissions`")
-
     with st.spinner("Loading…"):
         data = api("/api/permissions")
-
     if "_error" in data or not data.get("connected"):
         st.warning("⚠️ Not connected to HubSpot. Connect from the sidebar.")
         return
-
     st.success("🔑 Super Admin" if data.get("is_admin") else "👤 Standard User")
-
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Tool Access**")
@@ -390,17 +395,16 @@ def _permissions(status: dict):
         ok  = status.get("hubspot", {}).get("connected", False)
         msg = status.get("hubspot", {}).get("message", "")
         (st.success if ok else st.error)(f"{'✅' if ok else '❌'} {msg}")
-
     st.divider()
     scopes = data.get("scopes", [])
     st.markdown(f"**Granted Scopes ({len(scopes)})**")
     cats = {
         "CRM Objects": lambda s: s.startswith("crm.objects."),
         "CRM Schemas": lambda s: s.startswith("crm.schemas."),
-        "CMS":         lambda s: s.startswith("cms."),
-        "Settings":    lambda s: s.startswith("settings.") or s == "mcp.users.read",
-        "Analytics":   lambda s: s == "crm.hubsql.execute" or s.startswith("analytics."),
-        "Other":       lambda s: True,
+        "CMS"        : lambda s: s.startswith("cms."),
+        "Settings"   : lambda s: s.startswith("settings.") or s == "mcp.users.read",
+        "Analytics"  : lambda s: s in ("crm.hubsql.execute",) or s.startswith("analytics."),
+        "Other"      : lambda s: True,
     }
     used = set()
     for cat, fn in cats.items():
@@ -420,7 +424,6 @@ def _debug():
     import time
     st.markdown("### 🛠️ Debug MCP Connection")
     st.caption("Verify backend reachability and MCP tool connectivity")
-
     try:
         t0 = time.time()
         r  = requests.get(f"{BACKEND}/api/status", timeout=5)
@@ -429,16 +432,14 @@ def _debug():
     except Exception as e:
         st.error(f"❌ FastAPI not reachable\n\n{e}\n\nRun: `uvicorn web_app:app --port 8000`")
 
-    crm_choice = st.radio("Test MCP for:", ["HubSpot", "Zoho CRM"], horizontal=True)
-    crm_param  = "zoho" if crm_choice == "Zoho CRM" else "hubspot"
+    crm_choice = st.radio("Test MCP for:", ["HubSpot", "Zoho People"], horizontal=True)
+    crm_param  = "zoho_people" if crm_choice == "Zoho People" else "hubspot"
 
     if st.button("🔄 Test MCP Connection"):
         with st.spinner("Testing…"):
             result = api(f"/api/debug-mcp?crm={crm_param}")
-
         status = result.get("status", result.get("_error", "unknown"))
         (st.success if "ok" in str(status).lower() else st.error)(str(status))
-
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("**Connection Info**")
@@ -447,11 +448,16 @@ def _debug():
         with col2:
             tools = result.get("tools", [])
             if tools:
-                st.markdown(f"**Tools ({len(tools)})**")
+                st.markdown(f"**Sample Tools ({len(tools)})**")
                 for t in tools:
                     st.code(t, language=None)
-        if "error" in result:
-            st.error(f"**Error:** {result['error']}")
+
+    # RAG / cache stats
+    st.divider()
+    st.markdown("**📊 Cache Stats**")
+    if st.button("Refresh Stats"):
+        stats = api("/api/cache-stats")
+        st.json(stats)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -459,15 +465,18 @@ def _debug():
 def main():
     _handle_oauth_callback()
 
-    if crm := st.session_state.pop("_ok", ""):
-        st.toast(f"✅ {'HubSpot' if crm == 'hubspot' else 'Zoho CRM'} connected!", icon="🎉")
+    if crm := st.session_state.pop("_ok",  ""):
+        st.toast(f"✅ {'HubSpot' if crm == 'hubspot' else 'Zoho People'} connected!", icon="🎉")
     if err := st.session_state.pop("_err", ""):
         st.toast(f"❌ OAuth error: {err}", icon="⚠️")
 
     status = get_status()
 
     if "_error" in status:
-        st.error(f"⚠️ Backend unreachable — is uvicorn running on :8000?\n\n`{status['_error']}`")
+        st.error(
+            f"⚠️ Backend unreachable — is uvicorn running on :8000?\n\n"
+            f"`{status['_error']}`\n\nRun: `uvicorn web_app:app --port 8000`"
+        )
 
     _sidebar(status)
     _header(status)
