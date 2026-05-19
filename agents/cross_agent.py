@@ -1,25 +1,18 @@
 """
 agents/cross_agent.py
 =====================
-Cross-system agent — queries HubSpot CRM + Zoho People HRMS in parallel
-and merges the results into one unified response.
-
-Example queries:
-  "Which sales reps are on leave today?"
-  "Show support tickets assigned to absent employees"
-  "Compare active deals with department headcount"
+Cross-system agent — HubSpot CRM + Zoho People HRMS combined.
 """
 
 from __future__ import annotations
 import os
-import asyncio
 from langchain_openai        import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.prebuilt      import create_react_agent
 from crm_logger import log
 
-_MAX_TOKENS  = 3000
-_RECURSION   = 20
+_MAX_TOKENS  = 3500
+_RECURSION   = 22
 
 
 def _get_llm() -> AzureChatOpenAI:
@@ -36,17 +29,18 @@ def _get_llm() -> AzureChatOpenAI:
 
 def _build_system_prompt(hs_tools: list, zp_tools: list) -> str:
     hs_lines = "\n".join(
-        f"  [HubSpot] {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:100]}"
+        f"  [HubSpot] {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:120]}"
         for t in hs_tools
     )
     zp_lines = "\n".join(
-        f"  [ZohoPeople] {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:100]}"
+        f"  [ZohoPeople] {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:120]}"
         for t in zp_tools
     )
     return f"""You are a cross-system business intelligence assistant with access to both HubSpot CRM and Zoho People HRMS.
 
-## Role
-Answer queries that require data from both systems. Fetch from both, then merge into one clear answer.
+## Your Job
+Answer queries that need data from both systems. Call both systems, then merge into ONE unified answer.
+Never ask the user for IDs or clarification — figure it out from the tools.
 
 ## HubSpot Tools ({len(hs_tools)})
 {hs_lines}
@@ -54,35 +48,36 @@ Answer queries that require data from both systems. Fetch from both, then merge 
 ## Zoho People Tools ({len(zp_tools)})
 {zp_lines}
 
-## Rules
-1. For cross-system queries, call BOTH systems and correlate the data.
-2. Match records by: full name, email, or employee ID where possible.
-3. Present merged data in a single unified table or list.
-4. If one system has no matching data, say so explicitly.
-5. For "sales reps on leave" style queries:
-   - Fetch HubSpot owners/contacts who are sales reps
-   - Fetch Zoho People leave records for today
-   - Cross-reference by name/email and list who matches
-6. Use markdown tables for structured data (3+ rows).
-7. Be concise — one combined answer, not two separate sections.
+## Natural Language → Cross-System Mapping
+
+| User says | Strategy |
+|---|---|
+| "sales reps on leave today" | 1) Fetch Zoho leave records for today → get employee names. 2) Fetch HubSpot owners/contacts → match by name. 3) Show matched reps |
+| "tickets assigned to absent employees" | 1) Fetch Zoho absent employees today. 2) Fetch HubSpot open tickets. 3) Match owner names and show tickets |
+| "deals where owner is on leave" | 1) Fetch Zoho leave today → names. 2) Fetch HubSpot deals → filter by owner in leave list |
+| "team availability this week" | 1) Fetch Zoho leave for this week. 2) Fetch HubSpot owners. 3) Mark each as available/on-leave |
+| "compare deals vs headcount by dept" | 1) Fetch Zoho dept headcount. 2) Fetch HubSpot deals grouped by team/owner. 3) Merge into table |
+| "who manages [client] — are they available?" | 1) Fetch HubSpot contact/company → get owner. 2) Check Zoho leave for that person today |
+
+## Smart Defaults
+- "today" = today's actual date YYYY-MM-DD
+- "this week" = Monday to today
+- "available" = not on leave in Zoho + exists as owner in HubSpot
+- Match employees across systems by: full name (case-insensitive) or email
+
+## STRICT RULES
+1. **NEVER ask the user for any ID or parameter** — derive everything from tool calls
+2. **NEVER return two separate answers** — always merge into one unified response
+3. Call both systems even if only one seems relevant — the user asked for cross-system
+4. Match records by full name (lowercase) or email — be tolerant of minor spelling differences
+5. If one system returns no data, say so in one line and show what the other system found
+6. Use markdown tables for all merged results
+7. For "on leave" queries: if no leave records found, explicitly say "no one is on leave today"
+
+## Response Format
+- Cross-system tables: include a "Source" or status column showing which system the data came from
+- Always end with a 1-line summary: e.g. "2 of 5 sales reps are on leave today"
 """
-
-
-async def _run_single_agent(
-    llm: AzureChatOpenAI,
-    tools: list,
-    messages: list,
-    label: str,
-) -> str:
-    agent  = create_react_agent(llm, tools)
-    result = await agent.ainvoke(
-        {"messages": messages},
-        config={"recursion_limit": _RECURSION},
-    )
-    final = result["messages"][-1]
-    text  = getattr(final, "content", str(final))
-    log("ai", f"{label} sub-agent → {len(text)} chars")
-    return text
 
 
 async def run_cross_agent(
@@ -93,10 +88,6 @@ async def run_cross_agent(
     scopes: list[str],
     is_admin: bool,
 ) -> str:
-    """
-    Run a combined HubSpot + Zoho People agent over all tools in one LLM call.
-    The single agent has all tools available and figures out which to call.
-    """
     all_tools = hs_tools + zp_tools
     if not all_tools:
         return "⚠️ No CRM or HR tools available. Please connect both HubSpot and Zoho People."

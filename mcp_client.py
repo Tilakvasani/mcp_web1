@@ -201,6 +201,25 @@ class MCPClient:
             return text
 
     # ------------------------------------------------------------------
+    # Reconnect (in-place — same object identity, new transport)
+    # ------------------------------------------------------------------
+    async def reconnect(self):
+        """
+        Close the old transport and re-establish the connection.
+
+        The MCPClient object keeps its identity so any closures holding
+        a reference to ``self`` (e.g. the LangChain tool wrappers in
+        session_cache) keep working transparently.
+        """
+        try:
+            await self._exit_stack.aclose()
+        except Exception:
+            pass
+        self._session    = None
+        self._exit_stack = AsyncExitStack()
+        await self.connect()
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
     async def cleanup(self):

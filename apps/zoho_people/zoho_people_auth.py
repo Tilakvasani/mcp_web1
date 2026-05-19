@@ -51,6 +51,12 @@ def disconnect() -> None:
     DISCONNECT_FILE.write_text("disconnected")
 
 
+def reconnect() -> None:
+    """Remove the disconnect sentinel so the MCP URL from .env can load."""
+    if DISCONNECT_FILE.exists():
+        DISCONNECT_FILE.unlink()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Status helpers
 # ─────────────────────────────────────────────────────────────────────────────

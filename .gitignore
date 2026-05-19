@@ -21,6 +21,8 @@ build/
 .venv/
 venv/
 
+chroma_data/
+
 # uv
 .uv/
 uv.lock

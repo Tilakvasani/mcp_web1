@@ -1,35 +1,34 @@
 """
 rag/tool_indexer.py
 ===================
-Indexes tool descriptions into Chroma when a user connects,
-removes them when the user disconnects or the session ends.
+Indexes tool descriptions into Chroma once per agent type (not per session).
 
 Called from:
-  web_app.py → after HubSpot / Zoho People client connects
-  web_app.py → on disconnect / session end
+  core/agent.py -> after tools are loaded for hubspot / zoho_people
+  web_app.py    -> on disconnect (deindex)
 """
 
 from __future__ import annotations
 from rag.embeddings   import embed_tools
-from rag.chroma_store import index_tools, remove_session, is_indexed, _tool_doc
+from rag.chroma_store import index_tools, remove_agent, is_indexed, _tool_doc
 from crm_logger import log
 
 
-async def index_session_tools(session_id: str, tools: list) -> bool:
+async def index_agent_tools(agent_key: str, tools: list) -> bool:
     """
     Embed all tool descriptions and push into Chroma in ONE batch call.
-    Skips if already indexed (won't re-index unless force=True).
+    Skips if already indexed for this agent (global, not per-session).
     Returns True on success.
     """
     if not tools:
-        log("rag", f"no tools to index for session={session_id[:8]}")
+        log("rag", f"no tools to index for agent={agent_key}")
         return False
 
-    if is_indexed(session_id):
-        log("rag", f"already indexed for session={session_id[:8]} — skip")
+    if is_indexed(agent_key):
+        log("rag", f"already indexed for agent={agent_key} -- skip")
         return True
 
-    log("rag", f"indexing {len(tools)} tools for session={session_id[:8]}…")
+    log("rag", f"indexing {len(tools)} tools for agent={agent_key}...")
 
     # Build text documents for embedding
     docs = [_tool_doc(t) for t in tools]
@@ -37,21 +36,21 @@ async def index_session_tools(session_id: str, tools: list) -> bool:
     try:
         embeddings = await embed_tools(docs)
     except Exception as e:
-        log("error", f"embed_tools failed for session={session_id[:8]}: {e}")
+        log("error", f"embed_tools failed for agent={agent_key}: {e}")
         return False
 
-    count = index_tools(session_id, tools, embeddings)
-    log("rag", f"✅ indexed {count} tools for session={session_id[:8]}")
+    count = index_tools(agent_key, tools, embeddings)
+    log("rag", f"indexed {count} tools for agent={agent_key}")
     return count > 0
 
 
-async def reindex_session_tools(session_id: str, tools: list) -> bool:
-    """Force re-index — used when tools change (e.g. HubSpot scope change)."""
-    remove_session(session_id)
-    return await index_session_tools(session_id, tools)
+async def reindex_agent_tools(agent_key: str, tools: list) -> bool:
+    """Force re-index -- used when tools change (e.g. HubSpot scope change)."""
+    remove_agent(agent_key)
+    return await index_agent_tools(agent_key, tools)
 
 
-def deindex_session_tools(session_id: str):
-    """Remove all tool vectors for this session from Chroma. Called on disconnect."""
-    remove_session(session_id)
-    log("rag", f"🗑️  deindexed session={session_id[:8]}")
+def deindex_agent_tools(agent_key: str):
+    """Remove all tool vectors for this agent from Chroma. Called on disconnect."""
+    remove_agent(agent_key)
+    log("rag", f"deindexed agent={agent_key}")

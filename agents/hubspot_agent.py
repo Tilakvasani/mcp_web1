@@ -1,7 +1,7 @@
 """
 agents/hubspot_agent.py
 =======================
-HubSpot CRM agent — prompt builder + LangGraph ReAct runner.
+HubSpot CRM agent — smart prompt + LangGraph ReAct runner.
 """
 
 from __future__ import annotations
@@ -11,15 +11,9 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.prebuilt      import create_react_agent
 from crm_logger import log
 
-_MAX_TOKENS_SIMPLE  = 800
-_MAX_TOKENS_COMPLEX = 2500
-_RECURSION_LIMIT    = 18
-
-_SIMPLE_PATTERNS = [
-    "show", "list", "get", "find", "fetch", "display",
-    "what", "who", "how many", "count", "search",
-]
-
+_MAX_TOKENS_SIMPLE  = 1200
+_MAX_TOKENS_COMPLEX = 3000
+_RECURSION_LIMIT    = 20
 
 def _is_complex(message: str) -> bool:
     msg = message.lower()
@@ -43,16 +37,16 @@ def _get_llm(message: str) -> AzureChatOpenAI:
 
 def build_system_prompt(tools: list, scopes: list[str], is_admin: bool) -> str:
     tool_lines = "\n".join(
-        f"  • {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:120]}"
+        f"  • {getattr(t,'name','')}: {(getattr(t,'description','') or '')[:140]}"
         for t in tools
     )
     scope_str  = ", ".join(scopes[:12]) + ("…" if len(scopes) > 12 else "")
     admin_note = "Super Admin — all operations permitted." if is_admin else "Standard User."
 
-    return f"""You are an expert HubSpot CRM assistant with direct access to the HubSpot API via MCP tools.
+    return f"""You are an expert HubSpot CRM assistant with direct API access via MCP tools.
 
-## Role
-Answer the user's question by calling the right HubSpot tools. Be concise and accurate.
+## Your Job
+Translate natural language CRM queries into the correct tool calls — immediately, without asking for IDs or clarification.
 
 ## Available Tools ({len(tools)})
 {tool_lines}
@@ -61,13 +55,51 @@ Answer the user's question by calling the right HubSpot tools. Be concise and ac
 - Permission level : {admin_note}
 - Granted scopes   : {scope_str or 'unknown'}
 
-## Rules
-1. Always use tools to fetch live data — never invent records.
-2. For lists, show key fields only (name, amount, stage, owner, date).
-3. If a tool call fails, explain why briefly and suggest next steps.
-4. For write operations, confirm what you did with a short summary.
-5. Use markdown tables for lists of 3+ records.
-6. If you can't complete a task due to missing scope, tell the user which scope is needed.
+## Natural Language → Tool Action Mapping
+
+| User says | What to do |
+|---|---|
+| "show all deals" / "list deals" | Fetch all deals — no filter needed |
+| "open deals" / "active deals" | Fetch deals with stage NOT = closed |
+| "deals closing this month" | Fetch deals with closedate in current month |
+| "closed won this quarter" | Fetch deals with stage = closedwon in current quarter |
+| "pipeline overview" / "pipeline by stage" | Fetch all deals, group by dealstage |
+| "find contact [email/name]" | Search contacts by email or name — no ID needed |
+| "all contacts" / "list contacts" | Fetch contacts list with no filter |
+| "companies" / "top companies" | Fetch companies list, sort by deal value |
+| "unresolved tickets" / "open tickets" | Fetch tickets where status != closed |
+| "tasks due today" | Fetch tasks with duedate = today |
+| "recent emails" / "emails last 7 days" | Fetch email engagements for last 7 days |
+| "show meetings" | Fetch meeting engagements |
+| "who owns [deal/contact]" | Fetch the record and return the hubspot_owner_id resolved to name |
+| "create deal [name]" | Create a new deal — ask only for missing required fields |
+
+## Smart Defaults — USE THESE ALWAYS
+- "all deals/contacts/companies" = fetch the object list with NO filter — do NOT ask for an ID
+- "today" = use today's actual date in YYYY-MM-DD format
+- "this week" = Monday to today of current week
+- "this month" = first to last day of current month
+- "this quarter" = first day of current quarter to today
+- "open" / "active" = not closed / not resolved
+- Default sort for deals = closedate ascending
+- Default limit for lists = 20 records (unless user specifies more)
+
+## STRICT RULES
+1. **NEVER ask the user for a record ID or internal HubSpot ID** — search by name/email instead
+2. **NEVER ask for clarification on simple list or show queries** — just call the tool and return data
+3. If you need an ID to fetch details, first search by name/email to get the ID, then fetch
+4. Always use tools to get live data — never make up deal names, amounts, or contacts
+5. For lists of 3+ records use a markdown table with the most relevant columns
+6. For pipeline queries, group and summarise by stage with deal count and total value
+7. If a scope is missing for an operation, clearly tell the user which scope they need
+8. For write operations (create/update/delete), confirm with a 1-line summary
+
+## Response Format
+- Deal lists: `| Deal Name | Stage | Amount | Close Date | Owner |`
+- Contact lists: `| Name | Email | Company | Last Activity |`
+- Ticket lists: `| Subject | Status | Priority | Owner | Created |`
+- Pipeline summary: `| Stage | # Deals | Total Value |`
+- Single record: bullet list of key fields
 """
 
 
@@ -81,7 +113,6 @@ async def run_hubspot_agent(
     llm    = _get_llm(message)
     system = build_system_prompt(tools, scopes, is_admin)
 
-    # Trim history — keep last 10 messages to avoid prompt bloat
     trimmed_history = history[-10:] if len(history) > 10 else history
 
     messages: list = [SystemMessage(content=system)]

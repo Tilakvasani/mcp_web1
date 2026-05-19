@@ -135,7 +135,7 @@ _GENERIC_SUBSTRINGS = [
 
 async def hybrid_search(
     message: str,
-    session_id: str,
+    agent_key: str,
     all_tools: list,
     n_results: int = TOP_K,
 ) -> list:
@@ -153,8 +153,8 @@ async def hybrid_search(
     agent_hint, kw_substrings = _detect_intent(message)
 
     # ── Step 2: Chroma availability check ────────────────────────────────────
-    if not is_indexed(session_id):
-        log("rag", "Chroma not indexed — using keyword fallback")
+    if not is_indexed(agent_key):
+        log("rag", "Chroma not indexed -- using keyword fallback")
         return _keyword_fallback(message, all_tools, kw_substrings)
 
     # ── Step 3: embed query (cached) ─────────────────────────────────────────
@@ -165,7 +165,7 @@ async def hybrid_search(
     agent_filter = agent_hint if agent_hint and agent_hint != "both" else None
 
     ranked_names = search_tools(
-        session_id   = session_id,
+        agent_key    = agent_key,
         query_vec    = query_vec,
         n_results    = n_results * 2,   # get extra, we'll trim after re-rank
         agent_filter = agent_filter,
@@ -192,7 +192,7 @@ async def hybrid_search(
             result.append(t)
             selected.add(getattr(t, "name", ""))
 
-    log("rag", f"hybrid_search → {len(result)} tools (agent={agent_hint}, kw={len(kw_substrings)})")
+    log("rag", f"hybrid_search -> {len(result)} tools (agent={agent_hint}, kw={len(kw_substrings)})")
     return result
 
 

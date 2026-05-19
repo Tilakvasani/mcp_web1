@@ -1,14 +1,14 @@
 """
 Streamlit Frontend — AI Business Assistant
 ==========================================
-Tabs: HubSpot CRM · Zoho People HRMS · Cross-System
+Single unified chat. Intent is auto-detected by the backend.
 """
 
 import json
 import uuid
 import requests
 import streamlit as st
-from crm_logger import log, suppress_noisy_libs
+from crm_logger import suppress_noisy_libs
 suppress_noisy_libs()
 
 BACKEND = "http://localhost:8000"
@@ -24,71 +24,54 @@ st.markdown("""
 <style>
 #MainMenu, footer, header { visibility: hidden; }
 .main .block-container { padding-top: 0 !important; }
+.agent-badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 1px 8px;
+    border-radius: 999px;
+    margin-bottom: 4px;
+}
+.badge-hubspot     { background: #E85D3022; color: #E85D30; border: 1px solid #E85D3055; }
+.badge-zoho_people { background: #1D9E7522; color: #1D9E75; border: 1px solid #1D9E7555; }
+.badge-cross       { background: #534AB722; color: #534AB7; border: 1px solid #534AB755; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Session state ──────────────────────────────────────────────────────────
 _DEFAULTS = {
-    "session_id"       : str(uuid.uuid4()),
-    "active_agent"     : "hubspot",
-    "active_tab"       : "chat",
-    "prefill"          : "",
-    "messages_hubspot" : [],
-    "messages_zoho_people": [],
-    "messages_cross"   : [],
+    "session_id" : str(uuid.uuid4()),
+    "active_tab" : "chat",
+    "prefill"    : "",
+    "messages"   : [],   # single unified list — each item has role/content/agent
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Agent configs ──────────────────────────────────────────────────────────
-AGENTS = {
-    "hubspot": {
-        "label"      : "HubSpot CRM",
-        "icon"       : "🟠",
-        "placeholder": "Ask anything about your HubSpot CRM…",
-        "color"      : "#E85D30",
-        "prompts"    : [
-            ("📊 Pipeline overview",   "Summarise my HubSpot deal pipeline by stage"),
-            ("💼 Open deals",          "Show all open deals sorted by close date"),
-            ("🔍 Find a contact",      "Find contact john@acme.com"),
-            ("🎫 Unresolved tickets",  "Show all unresolved support tickets"),
-            ("🏢 Top companies",       "List top 10 companies by deal value"),
-            ("✅ Closed won",          "List all deals closed won this quarter"),
-            ("📋 Tasks due today",     "Show all tasks due today"),
-            ("📧 Recent emails",       "Show emails sent in the last 7 days"),
-        ],
-    },
-    "zoho_people": {
-        "label"      : "Zoho People HRMS",
-        "icon"       : "🟢",
-        "placeholder": "Ask anything about HR, employees, or attendance…",
-        "color"      : "#1D9E75",
-        "prompts"    : [
-            ("👥 All employees",       "List all active employees with their department"),
-            ("🏖️  On leave today",    "Who is on leave today?"),
-            ("📅 Attendance",          "Show attendance records for this week"),
-            ("🏢 Departments",         "List all departments with headcount"),
-            ("📝 Pending leave",       "Show all pending leave requests"),
-            ("🕐 Late arrivals",       "Who checked in late today?"),
-            ("👤 Employee profile",    "Show profile for Rahul Mehta"),
-            ("📊 Leave summary",       "Give me a leave summary for this month"),
-        ],
-    },
-    "cross": {
-        "label"      : "Cross-System",
-        "icon"       : "⚡",
-        "placeholder": "Query HubSpot + Zoho People together…",
-        "color"      : "#534AB7",
-        "prompts"    : [
-            ("🔗 Sales reps on leave", "Which sales reps are on leave today?"),
-            ("🎫 Absent + tickets",    "Show support tickets assigned to employees on leave"),
-            ("📊 Deals vs headcount",  "Compare active deals per department with headcount"),
-            ("👤 Contact → employee",  "Show the employee linked to client ABC Technologies"),
-            ("📅 Team availability",   "Which account managers are available this week?"),
-            ("🔄 Ownership gaps",      "Show open deals where the owner is currently absent"),
-        ],
-    },
+# ── Quick prompts (all agents combined) ────────────────────────────────────
+QUICK_PROMPTS = [
+    # HubSpot
+    ("🟠 Pipeline overview",   "Summarise my HubSpot deal pipeline by stage"),
+    ("🟠 Open deals",          "Show all open deals sorted by close date"),
+    ("🟠 Unresolved tickets",  "Show all unresolved support tickets"),
+    ("🟠 Tasks due today",     "Show all tasks due today"),
+    # Zoho People
+    ("🟢 All employees",       "List all active employees with their department"),
+    ("🟢 On leave today",      "Who is on leave today?"),
+    ("🟢 Attendance",          "Show attendance records for this week"),
+    ("🟢 Pending leave",       "Show all pending leave requests"),
+    # Cross
+    ("⚡ Sales reps on leave", "Which sales reps are on leave today?"),
+    ("⚡ Ownership gaps",      "Show open deals where the owner is currently absent"),
+    ("⚡ Absent + tickets",    "Show support tickets assigned to employees on leave"),
+    ("⚡ Team availability",   "Which account managers are available this week?"),
+]
+
+_AGENT_META = {
+    "hubspot"     : {"icon": "🟠", "label": "HubSpot CRM",        "badge": "badge-hubspot"},
+    "zoho_people" : {"icon": "🟢", "label": "Zoho People HRMS",   "badge": "badge-zoho_people"},
+    "cross"       : {"icon": "⚡", "label": "Cross-System",        "badge": "badge-cross"},
 }
 
 # ── API helpers ─────────────────────────────────────────────────────────────
@@ -101,22 +84,26 @@ def api(path: str, method: str = "GET", **kwargs) -> dict:
         return {"_error": str(e)}
 
 
-def api_stream_chat(message: str, history: list, agent: str):
+def api_stream_chat(message: str, history: list):
+    """Yields (chunk_text | None, detected_agent | None) tuples."""
     session_id = st.session_state.get("session_id", "default")
+    detected_agent = None
     try:
         with requests.post(
             f"{BACKEND}/api/chat",
             json    = {"message": message, "history": history,
-                       "agent": agent, "session_id": session_id},
+                       "agent": "auto", "session_id": session_id},
             stream  = True,
             timeout = 120,
             headers = {"Accept": "text/event-stream"},
         ) as resp:
             if resp.status_code == 429:
-                yield "\n\n⏳ **Rate limit reached** — please wait a moment."
+                yield None, None
+                yield "\n\n⏳ **Rate limit reached** — please wait a moment.", None
                 return
             if resp.status_code >= 400:
-                yield f"\n\n❌ **Backend error {resp.status_code}** — please try again."
+                yield None, None
+                yield f"\n\n❌ **Backend error {resp.status_code}** — please try again.", None
                 return
             buffer = ""
             for raw in resp.iter_content(chunk_size=None):
@@ -128,29 +115,32 @@ def api_stream_chat(message: str, history: list, agent: str):
                             try:
                                 data = json.loads(line[6:])
                                 t    = data.get("type")
-                                if t == "chunk":
-                                    yield data.get("text", "")
+                                if t == "agent":
+                                    detected_agent = data.get("agent")
+                                    yield None, detected_agent      # signal which agent
+                                elif t == "chunk":
+                                    yield data.get("text", ""), None
                                 elif t == "error":
-                                    yield _fmt_error(data.get("error",""), data.get("detail",""), agent)
+                                    yield _fmt_error(data.get("error",""), data.get("detail",""), detected_agent or "auto"), None
                                     return
                                 elif t == "done":
                                     return
                             except json.JSONDecodeError:
                                 pass
     except Exception as e:
-        yield f"\n\n❌ Stream error: {e}"
+        yield f"\n\n❌ Stream error: {e}", None
 
 
 def _fmt_error(error: str, detail: str, agent: str) -> str:
     msgs = {
-        "mcp_url_missing"        : "🔗 MCP URL not set — add it in the sidebar.",
-        "preflight_failed"       : f"🌐 Cannot reach MCP server. Detail: `{detail}`",
-        "hubspot_unavailable"    : "🔑 HubSpot not connected — click **Connect HubSpot**.",
+        "mcp_url_missing"            : "🔗 MCP URL not set — add it in the sidebar.",
+        "preflight_failed"           : f"🌐 Cannot reach MCP server. Detail: `{detail}`",
+        "hubspot_unavailable"        : "🔑 HubSpot not connected — click **Connect HubSpot**.",
         "zoho_people_mcp_url_missing": "🔗 Zoho People MCP URL not set — add it in the sidebar.",
-        "no_clients"             : "⚠️ No system connected. Connect from the sidebar first.",
-        "content_filter"         : "🛡️ Content safety filter triggered. Please rephrase.",
-        "rate_limit"             : "⏳ Too many requests — please wait a moment.",
-        "auth_error"             : "🔑 AI service auth failed. Check your API key.",
+        "no_clients"                 : "⚠️ No system connected. Connect from the sidebar first.",
+        "content_filter"             : "🛡️ Content safety filter triggered. Please rephrase.",
+        "rate_limit"                 : "⏳ Too many requests — please wait a moment.",
+        "auth_error"                 : "🔑 AI service auth failed. Check your API key.",
     }
     return f"\n\n{msgs.get(error, f'❌ {detail or error}')}"
 
@@ -162,7 +152,7 @@ def get_status() -> dict:
 
 def _handle_oauth_callback():
     p = st.query_params
-    if ok  := p.get("oauth_ok", ""):
+    if ok  := p.get("oauth_ok",    ""):
         st.session_state["_ok"]  = ok
         st.query_params.clear()
     elif err := p.get("oauth_error", ""):
@@ -170,50 +160,28 @@ def _handle_oauth_callback():
         st.query_params.clear()
 
 
-def _msg_key(agent: str) -> str:
-    return f"messages_{agent}"
-
-def _get_msgs() -> list:
-    return st.session_state.get(_msg_key(st.session_state.active_agent), [])
-
-def _set_msgs(msgs: list):
-    st.session_state[_msg_key(st.session_state.active_agent)] = msgs
-
-
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
 def _sidebar(status: dict):
     with st.sidebar:
         st.markdown("## 🤖 AI Assistant")
-        st.caption("HubSpot · Zoho People · Cross-System")
+        st.caption("Auto-routes to HubSpot · Zoho People · Cross-System")
         st.divider()
 
-        # Agent selector
-        st.markdown("**Active Agent**")
-        agent_cols = st.columns(3)
-        for col, (ag, cfg) in zip(agent_cols, AGENTS.items()):
-            with col:
-                active = st.session_state.active_agent == ag
-                if st.button(
-                    f"{cfg['icon']}",
-                    key              = f"ag_{ag}",
-                    use_container_width = True,
-                    type             = "primary" if active else "secondary",
-                    help             = cfg["label"],
-                ):
-                    if ag != st.session_state.active_agent:
-                        st.session_state.active_agent = ag
-                        st.rerun()
-
-        agent_label = AGENTS[st.session_state.active_agent]["label"]
-        st.caption(f"Active: **{agent_label}**")
+        # Connection legend
+        hs_ok = status.get("hubspot",     {}).get("connected", False)
+        zp_ok = status.get("zoho_people", {}).get("connected", False)
+        st.markdown("**Connected Systems**")
+        st.markdown(
+            f"{'✅' if hs_ok else '○'} HubSpot CRM  &nbsp;&nbsp; "
+            f"{'✅' if zp_ok else '○'} Zoho People"
+        )
         st.divider()
 
         # ── HubSpot ──────────────────────────────────────────────────────────
-        hs = status.get("hubspot", {})
         st.markdown("**🟠 HubSpot CRM**")
-        if hs.get("connected"):
-            st.success(f"✅ {hs.get('message','Connected')}")
+        if hs_ok:
+            st.success(f"✅ {status['hubspot'].get('message','Connected')}")
             if st.button("🔌 Disconnect HubSpot", use_container_width=True):
                 api("/api/disconnect", method="POST")
                 st.cache_data.clear()
@@ -225,18 +193,38 @@ def _sidebar(status: dict):
 
         st.divider()
 
-        # ── Zoho People ───────────────────────────────────────────────────────
-        zp = status.get("zoho_people", {})
+        # ── Zoho People ───────────────────────────────────────────────────────────
         st.markdown("**🟢 Zoho People HRMS**")
-        if zp.get("connected"):
-            st.success("✅ Zoho People Connected")
+        zp_data = status.get("zoho_people", {})
+        if zp_ok:
+            st.success("✅ MCP Connected")
+            api_ok  = zp_data.get("api_connected", False)
+            api_msg = zp_data.get("api_message", "")
+            if api_ok:
+                st.success(f"✅ {api_msg}")
+            else:
+                st.link_button(
+                    "🔗 Connect Zoho People API",
+                    f"{BACKEND}/oauth/zoho-people/connect",
+                    use_container_width=True,
+                )
+                st.caption("Enables listing employees, departments & more")
+
             if st.button("🔌 Disconnect Zoho People", use_container_width=True):
                 api("/zoho-people/disconnect", method="POST")
                 st.cache_data.clear()
                 st.rerun()
         else:
             st.warning("Not connected")
-            st.caption("Get your MCP URL from [Zoho People MCP](https://mcp.zoho.com) → copy your URL")
+            api_msg = zp_data.get("api_message", "")
+            if api_msg and "not configured" not in api_msg.lower():
+                st.link_button(
+                    "🔗 Connect Zoho People API",
+                    f"{BACKEND}/oauth/zoho-people/connect",
+                    use_container_width=True,
+                )
+            
+            st.caption("Get your MCP URL from [Zoho People MCP](https://mcp.zoho.com)")
             mcp_inp = st.text_input(
                 "Zoho People MCP URL",
                 label_visibility = "collapsed",
@@ -270,9 +258,8 @@ def _sidebar(status: dict):
         st.divider()
 
         # ── Quick prompts ─────────────────────────────────────────────────────
-        cfg = AGENTS[st.session_state.active_agent]
-        st.markdown(f"**Quick · {cfg['icon']} {cfg['label']}**")
-        for label, prompt in cfg["prompts"]:
+        st.markdown("**Quick Actions**")
+        for label, prompt in QUICK_PROMPTS:
             if st.button(label, key=f"qp_{label}", use_container_width=True):
                 st.session_state.prefill    = prompt
                 st.session_state.active_tab = "chat"
@@ -280,8 +267,8 @@ def _sidebar(status: dict):
 
         st.divider()
         if st.button("🗑️ Clear Chat", use_container_width=True):
-            _set_msgs([])
-            st.session_state.prefill = ""
+            st.session_state.messages = []
+            st.session_state.prefill  = ""
             st.rerun()
 
         st.caption("Backend :8000  ·  Frontend :8501")
@@ -290,54 +277,65 @@ def _sidebar(status: dict):
 # ── Header ───────────────────────────────────────────────────────────────────
 
 def _header(status: dict):
-    cfg   = AGENTS[st.session_state.active_agent]
-    hs_ok = status.get("hubspot",      {}).get("connected", False)
-    zp_ok = status.get("zoho_people",  {}).get("connected", False)
+    hs_ok = status.get("hubspot",     {}).get("connected", False)
+    zp_ok = status.get("zoho_people", {}).get("connected", False)
 
     c1, c2 = st.columns([5, 3])
     with c1:
-        st.markdown(f"### {cfg['icon']} AI Business Assistant")
-        st.caption(f"LangGraph · MCP · RAG · Mode: **{cfg['label']}**")
+        st.markdown("### 🤖 AI Business Assistant")
+        st.caption("LangGraph · MCP · RAG · Intent auto-detected per message")
     with c2:
         status_parts = [
             "🟠 HubSpot ✅" if hs_ok else "🟠 HubSpot ○",
-            "🟢 Zoho People ✅" if zp_ok else "🟢 Zoho People ○",
+            "🟢 Zoho ✅"    if zp_ok else "🟢 Zoho ○",
         ]
         st.markdown("  ·  ".join(status_parts))
-        st.caption(f"{cfg['icon']} {cfg['label']} active")
+        st.caption("Auto-routes: 🟠 HubSpot · 🟢 Zoho People · ⚡ Cross")
     st.divider()
 
 
 # ── Chat tab ─────────────────────────────────────────────────────────────────
 
 def _chat():
-    agent = st.session_state.active_agent
-    cfg   = AGENTS[agent]
-    msgs  = _get_msgs()
+    msgs = st.session_state.messages
 
-    if not msgs:
-        st.markdown(f"#### {cfg['icon']} {cfg['label']} — Ready")
-        if agent == "cross":
-            st.info("⚡ Cross-system mode queries both **HubSpot CRM** and **Zoho People HRMS** simultaneously.")
+    if not msgs and not st.session_state.get("prefill"):
+        st.markdown("#### 🤖 AI Business Assistant — Ready")
+        st.info(
+            "Just type naturally — I'll automatically figure out whether to query "
+            "**🟠 HubSpot CRM**, **🟢 Zoho People HRMS**, or **⚡ both** at once."
+        )
         st.markdown("**Try a quick action:**")
         cols = st.columns(4)
-        for i, (label, prompt) in enumerate(cfg["prompts"][:8]):
+        for i, (label, prompt) in enumerate(QUICK_PROMPTS[:8]):
             with cols[i % 4]:
-                if st.button(label, key=f"chip_{agent}_{i}", use_container_width=True):
+                if st.button(label, key=f"chip_{i}", use_container_width=True):
                     st.session_state.prefill = prompt
                     st.rerun()
         st.divider()
 
     for m in msgs:
-        avatar = cfg["icon"] if m["role"] == "assistant" else "👤"
-        with st.chat_message(m["role"], avatar=avatar):
-            st.markdown(m["content"])
+        agent_key = m.get("agent", "hubspot")
+        meta      = _AGENT_META.get(agent_key, _AGENT_META["hubspot"])
+
+        if m["role"] == "assistant":
+            with st.chat_message("assistant", avatar=meta["icon"]):
+                # Small badge showing which agent answered
+                st.markdown(
+                    f'<span class="agent-badge {meta["badge"]}">'
+                    f'{meta["icon"]} {meta["label"]}</span>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(m["content"])
+        else:
+            with st.chat_message("user", avatar="👤"):
+                st.markdown(m["content"])
 
     prefill = st.session_state.get("prefill", "")
     if prefill:
         st.session_state.prefill = ""
 
-    user_input = st.chat_input(cfg["placeholder"])
+    user_input = st.chat_input("Ask anything about your CRM or HR data…")
     if not user_input and prefill:
         user_input = prefill
 
@@ -353,11 +351,9 @@ def _send(text: str):
         st.warning("⚠️ Message too long — max 4,000 characters.")
         return
 
-    agent = st.session_state.active_agent
-    cfg   = AGENTS[agent]
-    msgs  = _get_msgs()
-    msgs.append({"role": "user", "content": text})
-    _set_msgs(msgs)
+    msgs = st.session_state.messages
+    msgs.append({"role": "user", "content": text, "agent": None})
+    st.session_state.messages = msgs
 
     with st.chat_message("user", avatar="👤"):
         st.markdown(text)
@@ -365,13 +361,38 @@ def _send(text: str):
     history = [{"role": m["role"], "content": m["content"]} for m in msgs[:-1]]
 
     import time as _t
-    t0 = _t.time()
-    with st.chat_message("assistant", avatar=cfg["icon"]):
-        full = st.write_stream(api_stream_chat(text, history, agent))
+    t0             = _t.time()
+    detected_agent = "hubspot"   # will be updated from stream
+    full_text      = ""
+
+    with st.chat_message("assistant", avatar="🤖"):
+        badge_slot = st.empty()
+        text_slot  = st.empty()
+        stream_buf = ""
+
+        for chunk, agent_signal in api_stream_chat(text, history):
+            if agent_signal:
+                detected_agent = agent_signal
+                meta = _AGENT_META.get(detected_agent, _AGENT_META["hubspot"])
+                badge_slot.markdown(
+                    f'<span class="agent-badge {meta["badge"]}">'
+                    f'{meta["icon"]} {meta["label"]}</span>',
+                    unsafe_allow_html=True,
+                )
+            if chunk:
+                stream_buf += chunk
+                text_slot.markdown(stream_buf + "▌")
+
+        full_text = stream_buf
+        text_slot.markdown(full_text or "⚠️ No response received.")
+
     elapsed = _t.time() - t0
 
-    msgs.append({"role": "assistant", "content": full or "⚠️ No response received."})
-    _set_msgs(msgs)
+    # Update the user message agent tag and save assistant reply
+    msgs[-1]["agent"] = detected_agent
+    msgs.append({"role": "assistant", "content": full_text or "⚠️ No response received.",
+                 "agent": detected_agent})
+    st.session_state.messages = msgs
 
 
 # ── Permissions tab ──────────────────────────────────────────────────────────
@@ -452,7 +473,6 @@ def _debug():
                 for t in tools:
                     st.code(t, language=None)
 
-    # RAG / cache stats
     st.divider()
     st.markdown("**📊 Cache Stats**")
     if st.button("Refresh Stats"):
