@@ -130,7 +130,7 @@ class _Cached:
 
 class MCPPool:
     MAX_AGE    = 600
-    PING_EVERY = 600     # MCP servers drop idle streams fast — ping every 5s
+    PING_EVERY = 60   # MCP servers drop idle streams fast — ping every 5s
 
     def __init__(self):
         self._pool = {}
@@ -441,9 +441,12 @@ async def _make_zoho_people_client():
 
 _VALID_AGENTS = ("hubspot", "zoho_people", "cross", "auto")
 
-async def _run_agent_turn(message, history, agent, session_id="default"):
-
-    # Auto intent detection
+async def _resolve_agent_and_clients(message, history, agent):
+    """
+    Resolves the target agent (with auto-intent detection) and sets up
+    the corresponding connection clients, scopes, and admin status.
+    Returns a dict with resolution outcome or guards.
+    """
     detected_agent = agent
     if agent == "auto":
         detected_agent = await detect_agent_intent(message, history)
@@ -492,6 +495,45 @@ async def _run_agent_turn(message, history, agent, session_id="default"):
             return {"ok": False, "error": "no_clients",
                     "detail": "Neither HubSpot nor Zoho People is connected.", "agent": detected_agent}
 
+    return {
+        "ok": True,
+        "agent": detected_agent,
+        "clients": clients,
+        "scopes": scopes,
+        "is_admin": is_admin
+    }
+
+
+def _handle_agent_exception(exc: Exception, detected_agent: str) -> dict:
+    """Standardized error handler mapping exceptions to user-friendly UI error objects."""
+    import traceback
+    tb = traceback.format_exc().strip().splitlines()
+    for line in tb[-3:]:
+        log("error", line.strip())
+
+    err = str(exc).lower()
+    if "content_filter" in err or "responsibleaipolicyviolation" in err or "content safety" in err:
+        return {"ok": False, "error": "content_filter",
+                "detail": "Content safety filter triggered. Please rephrase.", "agent": detected_agent}
+    if "rate_limit" in err or "429" in err:
+        return {"ok": False, "error": "rate_limit",
+                "detail": "Too many requests — please wait a moment.", "agent": detected_agent}
+    if "authentication" in err or "401" in err:
+        return {"ok": False, "error": "auth_error",
+                "detail": "AI service authentication failed. Check your API key.", "agent": detected_agent}
+    return {"ok": False, "error": "agent_error", "detail": str(exc), "agent": detected_agent}
+
+
+async def _run_agent_turn(message, history, agent, session_id="default"):
+    resolved = await _resolve_agent_and_clients(message, history, agent)
+    if not resolved["ok"]:
+        return resolved
+
+    detected_agent = resolved["agent"]
+    clients = resolved["clients"]
+    scopes = resolved["scopes"]
+    is_admin = resolved["is_admin"]
+
     t0 = time.time()
     try:
         text = await run_agent(
@@ -507,47 +549,52 @@ async def _run_agent_turn(message, history, agent, session_id="default"):
         return {"ok": True, "text": text, "agent": detected_agent}
 
     except Exception as exc:
-        import traceback
-        tb = traceback.format_exc().strip().splitlines()
-        for line in tb[-3:]:
-            log("error", line.strip())
-
-        # Only invalidate pool on auth errors, not transport errors.
-        # Transport errors are handled by MCPPool auto-reconnect.
-        err = str(exc).lower()
-        if "content_filter" in err or "responsibleaipolicyviolation" in err:
-            return {"ok": False, "error": "content_filter",
-                    "detail": "Content safety filter triggered. Please rephrase.", "agent": detected_agent}
-        if "rate_limit" in err or "429" in err:
-            return {"ok": False, "error": "rate_limit",
-                    "detail": "Too many requests — please wait a moment.", "agent": detected_agent}
-        if "authentication" in err or "401" in err:
-            return {"ok": False, "error": "auth_error",
-                    "detail": "AI service authentication failed. Check your API key.", "agent": detected_agent}
-        return {"ok": False, "error": "agent_error", "detail": str(exc), "agent": detected_agent}
+        return _handle_agent_exception(exc, detected_agent)
 
 
 async def _stream_agent(message, history, agent, session_id):
     log("stream", f"start | agent={agent} | session={session_id[:8]} | '{message[:60]}'")
-    result   = await _run_agent_turn(message, history, agent, session_id=session_id)
-    detected = result.get("agent", agent)
+    
+    # Import the streaming dispatcher from core
+    from core.agent import run_agent_stream
+
+    resolved = await _resolve_agent_and_clients(message, history, agent)
+    detected = resolved.get("agent", agent)
 
     # Always emit the detected agent so the UI can show a badge
     yield f"data: {json.dumps({'type': 'agent', 'agent': detected})}\n\n"
 
-    if not result["ok"]:
-        log("error", f"stream failed: {result['error']}")
-        yield f"data: {json.dumps({'type': 'error', 'error': result['error'], 'detail': result['detail']})}\n\n"
+    if not resolved["ok"]:
+        log("error", f"stream resolution failed: {resolved['error']}")
+        yield f"data: {json.dumps({'type': 'error', 'error': resolved['error'], 'detail': resolved['detail']})}\n\n"
         return
 
-    text   = result["text"] or ""
-    chunks = 0
-    for i in range(0, len(text), 160):
-        yield f"data: {json.dumps({'type': 'chunk', 'text': text[i:i+160]})}\n\n"
-        chunks += 1
-        await asyncio.sleep(0.003)
+    clients  = resolved["clients"]
+    scopes   = resolved["scopes"]
+    is_admin = resolved["is_admin"]
 
-    log("stream", f"done | {chunks} chunks | {len(text)} chars")
+    chunks = 0
+    try:
+        async for chunk in run_agent_stream(
+            message       = message,
+            history       = history,
+            clients       = clients,
+            agent         = detected,
+            granted_scopes= scopes,
+            is_admin      = is_admin,
+            session_id    = session_id,
+        ):
+            yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
+            chunks += 1
+            # Microscopic sleep to yield execution and allow downstream network buffers to flush
+            await asyncio.sleep(0.001)
+
+    except Exception as exc:
+        err_res = _handle_agent_exception(exc, detected)
+        yield f"data: {json.dumps({'type': 'error', 'error': err_res['error'], 'detail': err_res['detail']})}\n\n"
+        return
+
+    log("stream", f"done | {chunks} chunks | agent={detected}")
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 

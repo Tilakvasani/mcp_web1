@@ -1,9 +1,0 @@
-{
-  "access_token": "1000.da3cefde19ee48292116549f3831baf0.fe6a8cc57d9b9c1676aa56edb973db76",
-  "refresh_token": "1000.991c1660c36efa205435f57eebfbf256.add1e129f69e30bd573b385498af3b3b",
-  "scope": "ZOHOPEOPLE.forms.ALL ZOHOPEOPLE.dashboard.READ",
-  "api_domain": "https://www.zohoapis.in",
-  "token_type": "Bearer",
-  "expires_in": 3600,
-  "saved_at": 1779194735
-}

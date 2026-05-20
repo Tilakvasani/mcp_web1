@@ -20,24 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-#MainMenu, footer, header { visibility: hidden; }
-.main .block-container { padding-top: 0 !important; }
-.agent-badge {
-    display: inline-block;
-    font-size: 0.7rem;
-    font-weight: 600;
-    padding: 1px 8px;
-    border-radius: 999px;
-    margin-bottom: 4px;
-}
-.badge-hubspot     { background: #E85D3022; color: #E85D30; border: 1px solid #E85D3055; }
-.badge-zoho_people { background: #1D9E7522; color: #1D9E75; border: 1px solid #1D9E7555; }
-.badge-cross       { background: #534AB722; color: #534AB7; border: 1px solid #534AB755; }
-</style>
-""", unsafe_allow_html=True)
-
 # ── Session state ──────────────────────────────────────────────────────────
 _DEFAULTS = {
     "session_id" : str(uuid.uuid4()),
@@ -294,6 +276,60 @@ def _header(status: dict):
     st.divider()
 
 
+def render_assistant_content(content: str):
+    """
+    Parses and renders assistant response content.
+    If it contains a json-chart code block, it extracts the JSON,
+    strips the chart block from the text, renders the clean markdown,
+    and displays a native Streamlit chart underneath.
+    """
+    import re
+    import json
+    import pandas as pd
+    
+    pattern = r"```json-chart\s*(\{.*?\})\s*```"
+    match = re.search(pattern, content, re.DOTALL)
+    
+    if match:
+        # Strip the json-chart code block from the displayed text
+        clean_text = re.sub(pattern, "", content, flags=re.DOTALL).strip()
+        st.markdown(clean_text)
+        
+        try:
+            chart_config = json.loads(match.group(1))
+            chart_type = chart_config.get("type", "bar").lower().strip()
+            x_axis = chart_config.get("x")
+            y_axis = chart_config.get("y")
+            data = chart_config.get("data", [])
+            
+            if data and x_axis and y_axis:
+                df = pd.DataFrame(data)
+                
+                # Make sure the x and y axes columns exist in the dataframe
+                if x_axis in df.columns and y_axis in df.columns:
+                    # Let's convert numeric values to floats just in case they're strings
+                    df[y_axis] = pd.to_numeric(df[y_axis], errors='coerce')
+                    
+                    df_chart = df.set_index(x_axis)
+                    st.caption(f"📊 **Interactive {chart_type.title()} Chart: {y_axis} by {x_axis}**")
+                    if chart_type == "bar":
+                        st.bar_chart(df_chart[y_axis])
+                    elif chart_type == "line":
+                        st.line_chart(df_chart[y_axis])
+                    elif chart_type == "area":
+                        st.area_chart(df_chart[y_axis])
+                    else:
+                        st.bar_chart(df_chart[y_axis])
+                else:
+                    st.warning(f"⚠️ Chart rendering issue: Column keys '{x_axis}' or '{y_axis}' not found in data.")
+            else:
+                st.warning("⚠️ Chart configuration is missing required 'x', 'y' or 'data' fields.")
+        except Exception as e:
+            st.error(f"⚠️ Failed to parse or render chart: {e}")
+    else:
+        st.markdown(content)
+
+
 # ── Chat tab ─────────────────────────────────────────────────────────────────
 
 def _chat():
@@ -321,12 +357,8 @@ def _chat():
         if m["role"] == "assistant":
             with st.chat_message("assistant", avatar=meta["icon"]):
                 # Small badge showing which agent answered
-                st.markdown(
-                    f'<span class="agent-badge {meta["badge"]}">'
-                    f'{meta["icon"]} {meta["label"]}</span>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(m["content"])
+                st.caption(f"{meta['icon']} **{meta['label']}**")
+                render_assistant_content(m["content"])
         else:
             with st.chat_message("user", avatar="👤"):
                 st.markdown(m["content"])
@@ -374,17 +406,14 @@ def _send(text: str):
             if agent_signal:
                 detected_agent = agent_signal
                 meta = _AGENT_META.get(detected_agent, _AGENT_META["hubspot"])
-                badge_slot.markdown(
-                    f'<span class="agent-badge {meta["badge"]}">'
-                    f'{meta["icon"]} {meta["label"]}</span>',
-                    unsafe_allow_html=True,
-                )
+                badge_slot.caption(f"{meta['icon']} **{meta['label']}**")
             if chunk:
                 stream_buf += chunk
                 text_slot.markdown(stream_buf + "▌")
 
         full_text = stream_buf
-        text_slot.markdown(full_text or "⚠️ No response received.")
+        with text_slot.container():
+            render_assistant_content(full_text or "⚠️ No response received.")
 
     elapsed = _t.time() - t0
 

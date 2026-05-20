@@ -17,6 +17,8 @@ from crm_logger import log
 _CACHE: dict[str, tuple[str, float]] = {}
 _TTL   = 300  # 5 minutes
 
+import re
+
 # Any message containing these words → treat as write → never cache
 _WRITE_TOKENS = {
     "create", "add", "new", "make", "insert", "post",
@@ -29,7 +31,14 @@ _WRITE_TOKENS = {
 
 
 def _is_write(message: str) -> bool:
-    words = set(message.lower().split())
+    """
+    Check if the user message indicates a write/mutation action.
+    Cleans punctuation using regular expressions to ensure words like
+    'create-deal' or 'update!' are correctly matched against write tokens.
+    """
+    # Replace non-alphanumeric characters with spaces to handle punctuation/hyphens cleanly
+    clean_msg = re.sub(r'[^a-z0-9\s]', ' ', message.lower())
+    words = set(clean_msg.split())
     return bool(words & _WRITE_TOKENS)
 
 

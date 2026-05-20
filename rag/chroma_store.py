@@ -104,30 +104,27 @@ def remove_agent(agent_key: str):
 # Read operations
 # ---------------------------------------------------------------------------
 
-def search_tools(
-    agent_key: str,
+def _search_single_collection(
+    col_name: str,
     query_vec: list[float],
-    n_results: int = 15,
+    n_results: int,
     agent_filter: str | None = None,
-) -> list[str]:
+) -> list[tuple[str, float]]:
     """
-    Vector similarity search. Returns ranked list of tool names.
-    agent_filter: 'hubspot' | 'zoho_people' | None (search all)
+    Search a single Chroma collection.
+    Returns a list of tuples: (tool_name, distance)
     """
-    col_name = _col_name(agent_key)
-    db       = _get_chroma()
-
+    db = _get_chroma()
     try:
         col = db.get_collection(col_name)
     except Exception:
-        log("rag", f"no collection found for agent={agent_key}")
         return []
 
     count = col.count()
     if count == 0:
         return []
 
-    k      = min(n_results, count)
+    k = min(n_results, count)
     kwargs: dict = dict(
         query_embeddings = [query_vec],
         n_results        = k,
@@ -136,14 +133,57 @@ def search_tools(
     if agent_filter:
         kwargs["where"] = {"agent": {"$eq": agent_filter}}
 
-    results    = col.query(**kwargs)
-    tool_names = [m["tool_name"] for m in results["metadatas"][0]]
-    log("rag", f"vector search -> top {len(tool_names)} tools (filter={agent_filter})")
-    return tool_names
+    try:
+        results = col.query(**kwargs)
+    except Exception as e:
+        log("error", f"Query failed for collection {col_name}: {e}")
+        return []
+
+    if not results or "metadatas" not in results or not results["metadatas"] or not results["metadatas"][0]:
+        return []
+
+    metadatas = results["metadatas"][0]
+    distances = results["distances"][0] if "distances" in results and results["distances"] else [0.0] * len(metadatas)
+
+    return [(m["tool_name"], d) for m, d in zip(metadatas, distances)]
+
+
+def search_tools(
+    agent_key: str,
+    query_vec: list[float],
+    n_results: int = 15,
+    agent_filter: str | None = None,
+) -> list[str]:
+    """
+    Vector similarity search. Returns ranked list of tool names.
+    If agent_key is "cross", queries both collections and merges them by distance.
+    """
+    results = []
+    if agent_key == "cross":
+        # Search hubspot and zoho_people collections and merge
+        if not agent_filter or agent_filter == "hubspot":
+            results.extend(_search_single_collection(_col_name("hubspot"), query_vec, n_results, agent_filter))
+        if not agent_filter or agent_filter == "zoho_people":
+            results.extend(_search_single_collection(_col_name("zoho_people"), query_vec, n_results, agent_filter))
+        # Sort by distance ascending (closer/smaller distance is better)
+        results.sort(key=lambda x: x[1])
+        tool_names = [name for name, _ in results[:n_results]]
+        log("rag", f"cross-vector search -> combined top {len(tool_names)} tools")
+        return tool_names
+    else:
+        # Single collection search
+        col_name = _col_name(agent_key)
+        res = _search_single_collection(col_name, query_vec, n_results, agent_filter)
+        res.sort(key=lambda x: x[1])
+        tool_names = [name for name, _ in res]
+        log("rag", f"vector search -> top {len(tool_names)} tools for agent={agent_key}")
+        return tool_names
 
 
 def is_indexed(agent_key: str) -> bool:
     """True if tools are already indexed for this agent."""
+    if agent_key == "cross":
+        return is_indexed("hubspot") or is_indexed("zoho_people")
     if agent_key in _INDEXED:
         return True
     # Fallback: check Chroma (cold start after restart)
@@ -160,6 +200,8 @@ def is_indexed(agent_key: str) -> bool:
 
 def get_index_count(agent_key: str) -> int:
     """Return number of tools indexed for this agent."""
+    if agent_key == "cross":
+        return get_index_count("hubspot") + get_index_count("zoho_people")
     col_name = _col_name(agent_key)
     db       = _get_chroma()
     try:
