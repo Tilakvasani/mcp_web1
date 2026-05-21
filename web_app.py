@@ -137,29 +137,38 @@ class MCPPool:
         self._lock = asyncio.Lock()
 
     async def get(self, key):
+        client_to_reconnect = None
         async with self._lock:
             cached = self._pool.get(key)
             if not cached:
                 return None
             if cached.age() >= self.MAX_AGE:
-                log("pool", f"{key} expired -- reconnecting")
+                client_to_reconnect = cached.client
+            else:
+                client = cached.client
+
+        if client_to_reconnect:
+            log("pool", f"{key} expired -- reconnecting")
+            try:
+                await client_to_reconnect.reconnect()
+                async with self._lock:
+                    cached = self._pool.get(key)
+                    if cached and cached.client is client_to_reconnect:
+                        cached.created = time.time()
+                log("pool", f"{key} reconnected (was expired)")
+                return client_to_reconnect
+            except Exception as exc:
+                log("warn", f"{key} reconnect failed ({type(exc).__name__}) -- evicting")
                 try:
-                    await cached.client.reconnect()
-                    cached.created = time.time()
-                    log("pool", f"{key} reconnected (was expired)")
-                    return cached.client
-                except Exception as exc:
-                    log("warn", f"{key} reconnect failed ({type(exc).__name__}) -- evicting")
-                    try:
-                        await cached.client.cleanup()
-                    except Exception:
-                        pass
-                    del self._pool[key]
-                    return None
-            client = cached.client
+                    await client_to_reconnect.cleanup()
+                except Exception:
+                    pass
+                async with self._lock:
+                    self._pool.pop(key, None)
+                return None
 
         try:
-            await client.list_tools()
+            await asyncio.wait_for(client.list_tools(), timeout=3.0)
             log("pool", f"{key} reused (age {cached.age():.0f}s)")
             return client
         except Exception as exc:
@@ -393,11 +402,11 @@ async def _make_hubspot_client():
         return cached
     log("connect", "HubSpot -> connecting fresh...")
     try:
-        token = hs_get_token()
+        hs_get_token()
     except RuntimeError:
         log("error", "HubSpot -> no valid token")
         return None
-    client = MCPClient(url=HUBSPOT_MCP_URL, headers={"Authorization": f"Bearer {token}"})
+    client = MCPClient(url=HUBSPOT_MCP_URL, headers=lambda: {"Authorization": f"Bearer {hs_get_token()}"})
     ok, msg = await client.preflight()
     if not ok:
         log("error", f"HubSpot preflight failed: {msg}")
@@ -719,10 +728,10 @@ async def api_debug_mcp(crm: str = "hubspot"):
         client = MCPClient(url=mcp_url, headers={})
     else:
         try:
-            token = hs_get_token()
+            hs_get_token()
         except RuntimeError as exc:
             return JSONResponse({"error": str(exc)}, status_code=401)
-        client = MCPClient(url=HUBSPOT_MCP_URL, headers={"Authorization": f"Bearer {token}"})
+        client = MCPClient(url=HUBSPOT_MCP_URL, headers=lambda: {"Authorization": f"Bearer {hs_get_token()}"})
 
     ok, msg = await client.preflight()
     if not ok:

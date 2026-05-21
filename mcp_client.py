@@ -53,12 +53,18 @@ class MCPClient:
             tools = await client.list_tools()
     """
 
-    def __init__(self, url: str, headers: Optional[dict] = None):
+    def __init__(self, url: str, headers: Any = None):
         self._url        = url
         self._headers    = headers or {}
         self._session: Optional[ClientSession] = None
         self._exit_stack = AsyncExitStack()
         self._transport_used: str = "none"
+
+    def get_headers(self) -> dict:
+        """Evaluate headers dynamic callback if provided, otherwise return the static dict."""
+        if callable(self._headers):
+            return self._headers()
+        return self._headers
 
     # ------------------------------------------------------------------
     # Pre-flight check
@@ -81,7 +87,7 @@ class MCPClient:
                 r = await hc.post(
                     self._url,
                     headers={
-                        **self._headers,
+                        **self.get_headers(),
                         "Content-Type": "application/json",
                         "Accept": "application/json, text/event-stream",
                     },
@@ -102,7 +108,7 @@ class MCPClient:
         # --- attempt 2: plain GET fallback (HubSpot-style) ---
         try:
             async with httpx.AsyncClient(timeout=10) as hc:
-                r = await hc.get(self._url, headers=self._headers, follow_redirects=True)
+                r = await hc.get(self._url, headers=self.get_headers(), follow_redirects=True)
             msg = f"HTTP {r.status_code} on {self._url}"
             if r.status_code == 401:
                 return False, f"401 Unauthorized — token invalid or expired ({self._url})"
@@ -123,27 +129,38 @@ class MCPClient:
         This works for both HubSpot and Zoho MCP servers.
         """
         try:
-            # Both HubSpot and Zoho use Streamable HTTP transport
-            transport = await self._exit_stack.enter_async_context(
-                streamablehttp_client(
-                    self._url,
-                    headers={
-                        **self._headers,
-                        "Accept": "application/json, text/event-stream",
-                        "Content-Type": "application/json",
-                    },
-                    timeout=30.0,
+            async def _do_connect():
+                transport = await self._exit_stack.enter_async_context(
+                    streamablehttp_client(
+                        self._url,
+                        headers={
+                            **self.get_headers(),
+                            "Accept": "application/json, text/event-stream",
+                            "Content-Type": "application/json",
+                        },
+                        timeout=15.0,
+                    )
                 )
-            )
-            self._transport_used = f"streamable_http ({self._url})"
-            # Extract read/write streams
-            read, write = transport[0], transport[1]
+                self._transport_used = f"streamable_http ({self._url})"
+                # Extract read/write streams
+                read, write = transport[0], transport[1]
+                
+                self._session = await self._exit_stack.enter_async_context(
+                    ClientSession(read, write)
+                )
+                await self._session.initialize()
+
+            # Guard connections with a 15-second timeout to prevent indefinite hangs
+            await asyncio.wait_for(_do_connect(), timeout=15.0)
             
-            self._session = await self._exit_stack.enter_async_context(
-                ClientSession(read, write)
-            )
-            await self._session.initialize()
-            
+        except asyncio.TimeoutError as exc:
+            try:
+                await self._exit_stack.aclose()
+            except Exception:
+                pass
+            self._session    = None
+            self._exit_stack = AsyncExitStack()
+            raise ConnectionError("MCP connection timed out after 15 seconds") from exc
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
@@ -200,11 +217,9 @@ class MCPClient:
         except (json.JSONDecodeError, ValueError):
             return text
 
-    # ------------------------------------------------------------------
-    # Reconnect (in-place — same object identity, new transport)
-    # ------------------------------------------------------------------
     async def reconnect(self):
         """
+
         Close the old transport and re-establish the connection.
 
         The MCPClient object keeps its identity so any closures holding
@@ -212,7 +227,7 @@ class MCPClient:
         session_cache) keep working transparently.
         """
         try:
-            await self._exit_stack.aclose()
+            await asyncio.wait_for(self._exit_stack.aclose(), timeout=2.0)
         except Exception:
             pass
         self._session    = None
@@ -224,7 +239,7 @@ class MCPClient:
     # ------------------------------------------------------------------
     async def cleanup(self):
         try:
-            await self._exit_stack.aclose()
+            await asyncio.wait_for(self._exit_stack.aclose(), timeout=2.0)
         except Exception:
             pass
         self._session = None
