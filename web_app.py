@@ -29,13 +29,12 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from openai import AsyncAzureOpenAI
 from dotenv import load_dotenv
 
 from crm_logger import log, suppress_noisy_libs
 suppress_noisy_libs()
 
-from mcp_client import MCPClient
+from mcp_manager import MCPManager
 
 from core.agent import (
     run_agent,
@@ -116,258 +115,37 @@ _hs_pkce = _TTLDict(max_age=600)
 
 
 # =============================================================================
-# MCP Connection Pool
+# MCPManager (replaces MCPPool + keepalive + intent detection)
 # =============================================================================
 
-class _Cached:
-    def __init__(self, client):
-        self.client  = client
-        self.created = time.time()
+mcp_manager = MCPManager()
 
-    def age(self):
-        return time.time() - self.created
-
-
-class MCPPool:
-    MAX_AGE    = 600
-    PING_EVERY = 60   # MCP servers drop idle streams fast — ping every 5s
-
-    def __init__(self):
-        self._pool = {}
-        self._lock = asyncio.Lock()
-
-    async def get(self, key):
-        client_to_reconnect = None
-        async with self._lock:
-            cached = self._pool.get(key)
-            if not cached:
-                return None
-            if cached.age() >= self.MAX_AGE:
-                client_to_reconnect = cached.client
-            else:
-                client = cached.client
-
-        if client_to_reconnect:
-            log("pool", f"{key} expired -- reconnecting")
-            try:
-                await client_to_reconnect.reconnect()
-                async with self._lock:
-                    cached = self._pool.get(key)
-                    if cached and cached.client is client_to_reconnect:
-                        cached.created = time.time()
-                log("pool", f"{key} reconnected (was expired)")
-                return client_to_reconnect
-            except Exception as exc:
-                log("warn", f"{key} reconnect failed ({type(exc).__name__}) -- evicting")
-                try:
-                    await client_to_reconnect.cleanup()
-                except Exception:
-                    pass
-                async with self._lock:
-                    self._pool.pop(key, None)
-                return None
-
-        try:
-            await asyncio.wait_for(client.list_tools(), timeout=3.0)
-            log("pool", f"{key} reused (age {cached.age():.0f}s)")
-            return client
-        except Exception as exc:
-            # Transport stale -- try to reconnect in-place
-            log("warn", f"{key} stale ({type(exc).__name__}) -- reconnecting")
-            try:
-                await client.reconnect()
-                async with self._lock:
-                    c = self._pool.get(key)
-                    if c:
-                        c.created = time.time()
-                log("pool", f"{key} reconnected after stale")
-                return client
-            except Exception as exc2:
-                log("warn", f"{key} reconnect failed ({type(exc2).__name__}) -- evicting")
-                async with self._lock:
-                    self._pool.pop(key, None)
-                try:
-                    await client.cleanup()
-                except Exception:
-                    pass
-                return None
-
-    async def put(self, key, client):
-        async with self._lock:
-            self._pool[key] = _Cached(client)
-        log("connect", f"{key} cached in pool")
-
-    async def invalidate(self, key):
-        async with self._lock:
-            cached = self._pool.pop(key, None)
-        if cached:
-            try:
-                await cached.client.cleanup()
-            except Exception:
-                pass
-            log("bye", f"evicted: {key}")
-
-    async def invalidate_all(self):
-        async with self._lock:
-            snapshot = dict(self._pool)
-            self._pool.clear()
-        for c in snapshot.values():
-            try:
-                await c.client.cleanup()
-            except Exception:
-                pass
-        log("bye", "all pool clients evicted")
-
-    async def keepalive(self):
-        async with self._lock:
-            snapshot = dict(self._pool)
-        for key, cached in snapshot.items():
-            try:
-                ok, _ = await cached.client.preflight()
-                if ok:
-                    log("ping", f"{key} alive")
-                else:
-                    # Try reconnect before evicting
-                    log("warn", f"{key} preflight failed -- reconnecting")
-                    try:
-                        await cached.client.reconnect()
-                        async with self._lock:
-                            c = self._pool.get(key)
-                            if c:
-                                c.created = time.time()
-                        log("pool", f"{key} reconnected via keepalive")
-                    except Exception:
-                        async with self._lock:
-                            self._pool.pop(key, None)
-                        try:
-                            await cached.client.cleanup()
-                        except Exception:
-                            pass
-                        log("warn", f"evicted stale: {key}")
-            except Exception:
-                async with self._lock:
-                    self._pool.pop(key, None)
-                try:
-                    await cached.client.cleanup()
-                except Exception:
-                    pass
-                log("warn", f"evicted stale: {key}")
-
-
-_pool = MCPPool()
-
-async def _keepalive_loop():
-    while True:
-        await asyncio.sleep(MCPPool.PING_EVERY)
-        await _pool.keepalive()
-        await evict_stale_sessions()
-
-
-# =============================================================================
-# Intent Detector  (NEW)
-# =============================================================================
-
-_INTENT_SYSTEM_PROMPT = """You are an intent classifier for a business AI assistant.
-
-Given a user message, decide which backend agent should handle it.
-
-Agents:
-- "hubspot"     -> HubSpot CRM: deals, contacts, companies, tickets, tasks, meetings, emails, pipelines, workflows
-- "zoho_people" -> Zoho People HRMS: employees, leave, attendance, departments, payroll, shifts, appraisals
-- "cross"       -> Both systems: queries that span CRM + HR data (e.g. "which sales reps are on leave?")
-
-Rules:
-- CRM/sales/deal/contact/ticket topics only  -> hubspot
-- HR/employee/leave/attendance topics only   -> zoho_people
-- Both topics, or comparison/join queries    -> cross
-- Greetings or off-topic                     -> hubspot (pre_router will catch them)
-
-Respond with ONLY one word: hubspot, zoho_people, or cross."""
-
-_openai_client = None
-
-def _get_openai_client():
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = AsyncAzureOpenAI(
-            api_key        = os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version    = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
-            azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT"),
-        )
-    return _openai_client
-
-
-async def detect_agent_intent(message: str, history: list) -> str:
-    """Classify message as: hubspot | zoho_people | cross"""
-
-    # Fast rule-based shortcuts (zero LLM cost)
-    msg_lower = message.lower()
-
-    crm_kw  = {"deal","deals","contact","contacts","company","companies","ticket","tickets",
-                "pipeline","hubspot","task","tasks","meeting","meetings","email","crm","sales","stage"}
-    hr_kw   = {"employee","employees","leave","attendance","department","departments","payroll",
-                "shift","shifts","appraisal","zoho","hrms","hr","people","absent","on leave"}
-    cross_kw = ["sales rep","account manager","both","compare","availability","assigned to"]
-
-    has_crm  = any(k in msg_lower for k in crm_kw)
-    has_hr   = any(k in msg_lower for k in hr_kw)
-    has_both = any(k in msg_lower for k in cross_kw)
-
-    if has_crm and has_hr:
-        return "cross"
-    if has_both and (has_crm or has_hr):
-        return "cross"
-    if has_hr and not has_crm:
-        return "zoho_people"
-    if has_crm and not has_hr:
-        return "hubspot"
-
-    # Ambiguous → LLM fallback
-    try:
-        history_str = ""
-        if history:
-            recent = history[-3:]
-            history_str = "\n".join(
-                f"{m['role'].upper()}: {m['content'][:120]}" for m in recent
-            )
-        user_content = (
-            f"History:\n{history_str}\n\nMessage: {message}"
-            if history_str else
-            f"Message: {message}"
-        )
-        client = _get_openai_client()
-        resp = await client.chat.completions.create(
-            model    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
-            messages = [
-                {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
-                {"role": "user",   "content": user_content},
-            ],
-            max_tokens  = 5,
-            temperature = 0,
-        )
-        result = resp.choices[0].message.content.strip().lower()
-        if result in ("hubspot", "zoho_people", "cross"):
-            log("intent", f"LLM detected -> {result} for '{message[:50]}'")
-            return result
-    except Exception as exc:
-        log("warn", f"intent detection failed: {exc} — defaulting to hubspot")
-
-    return "hubspot"
 
 
 # =============================================================================
 # Lifespan
 # =============================================================================
 
+async def _stale_session_eviction_loop():
+    """Periodically evict stale sessions from the session cache."""
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        await evict_stale_sessions()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     assert os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"), "AZURE_OPENAI_DEPLOYMENT_NAME missing"
     assert os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"), "AZURE_OPENAI_EMBEDDING_DEPLOYMENT missing"
+
+    # Auto-register any already-authenticated services on startup
+    _register_hubspot()
+    _register_zoho_people()
+
+    task = asyncio.create_task(_stale_session_eviction_loop())
     log("boot", "FastAPI ready -> http://localhost:8000")
-    task = asyncio.create_task(_keepalive_loop())
     yield
     task.cancel()
-    await _pool.invalidate_all()
     log("bye", "shutdown complete")
 
 
@@ -393,124 +171,45 @@ async def access_log(request: Request, call_next):
 
 
 # =============================================================================
-# MCP client factories
+# MCP connection helpers (MCPManager-based — no persistent pool)
 # =============================================================================
 
-async def _make_hubspot_client():
-    cached = await _pool.get("hubspot")
-    if cached:
-        return cached
-    log("connect", "HubSpot -> connecting fresh...")
+def _register_hubspot():
+    """Register HubSpot in MCPManager if token is available."""
     try:
         hs_get_token()
+        mcp_manager.set_hubspot(access_token_fn=hs_get_token)
+        log("connect", "HubSpot registered in MCPManager ✓")
+        return True
     except RuntimeError:
         log("error", "HubSpot -> no valid token")
-        return None
-    client = MCPClient(url=HUBSPOT_MCP_URL, headers=lambda: {"Authorization": f"Bearer {hs_get_token()}"})
-    ok, msg = await client.preflight()
-    if not ok:
-        log("error", f"HubSpot preflight failed: {msg}")
-        return None
-    try:
-        await client.connect()
-        await _pool.put("hubspot", client)
-        log("ok", "HubSpot connected ✓")
-        return client
-    except ConnectionError as exc:
-        log("error", f"HubSpot connect error: {exc}")
-        return None
+        return False
 
 
-async def _make_zoho_people_client():
+def _register_zoho_people():
+    """Register Zoho People in MCPManager if MCP URL is available."""
     mcp_url = zp_get_mcp_url()
     if not mcp_url:
-        return None, "mcp_url_missing"
-    cached = await _pool.get("zoho_people")
-    if cached:
-        return cached, ""
-    log("connect", "Zoho People -> connecting fresh...")
-    client = MCPClient(url=mcp_url, headers={})
-    ok, msg = await client.preflight()
-    if not ok:
-        log("error", f"Zoho People preflight failed: {msg}")
-        return None, "preflight_failed"
-    try:
-        await client.connect()
-        await _pool.put("zoho_people", client)
-        log("ok", "Zoho People connected ✓")
-        return client, ""
-    except ConnectionError as exc:
-        log("error", f"Zoho People connect error: {exc}")
-        return None, "connect_failed"
+        return False, "mcp_url_missing"
+    from apps.zoho_people.zoho_people_oauth import get_access_token as zp_get_token
+    mcp_manager.set_zoho_people(mcp_url=mcp_url, access_token_fn=zp_get_token)
+    log("connect", "Zoho People registered in MCPManager ✓")
+    return True, ""
 
 
 # =============================================================================
 # Agent runner
 # =============================================================================
 
-_VALID_AGENTS = ("hubspot", "zoho_people", "cross", "auto")
+_VALID_AGENTS = ("hubspot", "zoho_people", "cross", "auto", "unified")
 
-async def _resolve_agent_and_clients(message, history, agent):
+
+def _build_clients_from_manager() -> dict:
     """
-    Resolves the target agent (with auto-intent detection) and sets up
-    the corresponding connection clients, scopes, and admin status.
-    Returns a dict with resolution outcome or guards.
+    Return all currently registered MCP names mapped to mcp_manager.
+    The unified agent uses mcp_manager.get_tools([name]) per key.
     """
-    detected_agent = agent
-    if agent == "auto":
-        detected_agent = await detect_agent_intent(message, history)
-        log("intent", f"auto-detected agent: {detected_agent}")
-
-    clients  = {}
-    scopes   = []
-    is_admin = False
-
-    if detected_agent in ("hubspot", "cross"):
-        hs = await _make_hubspot_client()
-        if hs:
-            clients["hubspot"] = hs
-            scopes = get_token_scopes()
-            try:
-                token   = hs_get_token()
-                user_id = get_token_user_id()
-                if user_id and token:
-                    is_admin = await check_is_admin(token, user_id)
-            except Exception:
-                pass
-
-    zp_err = ""
-    if detected_agent in ("zoho_people", "cross"):
-        zp, zp_err = await _make_zoho_people_client()
-        if zp:
-            clients["zoho_people"] = zp
-
-    # Guard failures — with graceful cross fallback
-    if detected_agent == "hubspot" and "hubspot" not in clients:
-        return {"ok": False, "error": "hubspot_unavailable",
-                "detail": "HubSpot not connected or token expired.", "agent": detected_agent}
-    if detected_agent == "zoho_people" and "zoho_people" not in clients:
-        return {"ok": False, "error": f"zoho_people_{zp_err}",
-                "detail": f"Zoho People unavailable: {zp_err}", "agent": detected_agent}
-    if detected_agent == "cross" and not clients:
-        hs = await _make_hubspot_client()
-        zp, _ = await _make_zoho_people_client()
-        if hs:
-            clients["hubspot"]  = hs
-            detected_agent = "hubspot"
-        elif zp:
-            clients["zoho_people"] = zp
-            detected_agent = "zoho_people"
-        else:
-            return {"ok": False, "error": "no_clients",
-                    "detail": "Neither HubSpot nor Zoho People is connected.", "agent": detected_agent}
-
-    return {
-        "ok": True,
-        "agent": detected_agent,
-        "clients": clients,
-        "scopes": scopes,
-        "is_admin": is_admin
-    }
+    return mcp_manager.get_active_clients()
 
 
 def _handle_agent_exception(exc: Exception, detected_agent: str) -> dict:
@@ -533,77 +232,53 @@ def _handle_agent_exception(exc: Exception, detected_agent: str) -> dict:
     return {"ok": False, "error": "agent_error", "detail": str(exc), "agent": detected_agent}
 
 
-async def _run_agent_turn(message, history, agent, session_id="default"):
-    resolved = await _resolve_agent_and_clients(message, history, agent)
-    if not resolved["ok"]:
-        return resolved
-
-    detected_agent = resolved["agent"]
-    clients = resolved["clients"]
-    scopes = resolved["scopes"]
-    is_admin = resolved["is_admin"]
-
-    t0 = time.time()
-    try:
-        text = await run_agent(
-            message       = message,
-            history       = history,
-            clients       = clients,
-            agent         = detected_agent,
-            granted_scopes= scopes,
-            is_admin      = is_admin,
-            session_id    = session_id,
-        )
-        log("ok", f"agent done -> {len(text or '')} chars in {time.time()-t0:.1f}s")
-        return {"ok": True, "text": text, "agent": detected_agent}
-
-    except Exception as exc:
-        return _handle_agent_exception(exc, detected_agent)
-
-
 async def _stream_agent(message, history, agent, session_id):
-    log("stream", f"start | agent={agent} | session={session_id[:8]} | '{message[:60]}'")
-    
-    # Import the streaming dispatcher from core
+    log("stream", f"start | agent=unified | session={session_id[:8]} | '{message[:60]}'")
+
     from core.agent import run_agent_stream
 
-    resolved = await _resolve_agent_and_clients(message, history, agent)
-    detected = resolved.get("agent", agent)
+    # All connected MCPs — unified agent routes internally
+    clients = _build_clients_from_manager()
 
-    # Always emit the detected agent so the UI can show a badge
-    yield f"data: {json.dumps({'type': 'agent', 'agent': detected})}\n\n"
+    # Always emit "unified" so the UI can show a badge
+    yield f"data: {json.dumps({'type': 'agent', 'agent': 'unified'})}\n\n"
 
-    if not resolved["ok"]:
-        log("error", f"stream resolution failed: {resolved['error']}")
-        yield f"data: {json.dumps({'type': 'error', 'error': resolved['error'], 'detail': resolved['detail']})}\n\n"
+    if not clients:
+        yield f"data: {json.dumps({'type': 'error', 'error': 'no_clients', 'detail': 'No MCP services connected. Please connect HubSpot or Zoho People.'})}\n\n"
         return
 
-    clients  = resolved["clients"]
-    scopes   = resolved["scopes"]
-    is_admin = resolved["is_admin"]
+    scopes   = get_token_scopes() if mcp_manager.is_connected("hubspot") else []
+    is_admin = False
+    if mcp_manager.is_connected("hubspot"):
+        try:
+            token   = hs_get_token()
+            user_id = get_token_user_id()
+            if user_id and token:
+                is_admin = await check_is_admin(token, user_id)
+        except Exception:
+            pass
 
     chunks = 0
     try:
         async for chunk in run_agent_stream(
-            message       = message,
-            history       = history,
-            clients       = clients,
-            agent         = detected,
-            granted_scopes= scopes,
-            is_admin      = is_admin,
-            session_id    = session_id,
+            message        = message,
+            history        = history,
+            clients        = clients,
+            agent          = "unified",
+            granted_scopes = scopes,
+            is_admin       = is_admin,
+            session_id     = session_id,
         ):
             yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
             chunks += 1
-            # Microscopic sleep to yield execution and allow downstream network buffers to flush
             await asyncio.sleep(0.001)
 
     except Exception as exc:
-        err_res = _handle_agent_exception(exc, detected)
+        err_res = _handle_agent_exception(exc, "unified")
         yield f"data: {json.dumps({'type': 'error', 'error': err_res['error'], 'detail': err_res['detail']})}\n\n"
         return
 
-    log("stream", f"done | {chunks} chunks | agent={detected}")
+    log("stream", f"done | {chunks} chunks | agent=unified")
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
@@ -721,34 +396,19 @@ async def api_cache_stats():
 @app.get("/api/debug-mcp")
 async def api_debug_mcp(crm: str = "hubspot"):
     log("debug", f"MCP test -> crm={crm}")
-    if crm == "zoho_people":
-        mcp_url = zp_get_mcp_url()
-        if not mcp_url:
-            return JSONResponse({"error": "mcp_url_missing"}, status_code=400)
-        client = MCPClient(url=mcp_url, headers={})
-    else:
-        try:
-            hs_get_token()
-        except RuntimeError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=401)
-        client = MCPClient(url=HUBSPOT_MCP_URL, headers=lambda: {"Authorization": f"Bearer {hs_get_token()}"})
-
-    ok, msg = await client.preflight()
-    if not ok:
-        return {"status": "preflight_failed", "detail": msg}
+    if not mcp_manager.is_connected(crm):
+        return JSONResponse({"error": f"{crm} not registered in MCPManager"}, status_code=400)
     try:
-        await client.connect()
-        tools = await client.list_tools()
-        result = {
+        tools = await mcp_manager.get_tools([crm])
+        return {
             "status"    : "ok",
-            "transport" : client.transport,
+            "crm"       : crm,
             "tool_count": len(tools),
-            "tools"     : [t.name for t in tools[:15]],
+            "tools"     : [getattr(t, "name", str(t)) for t in tools[:15]],
         }
-        await client.cleanup()
-        return result
-    except ConnectionError as exc:
-        return {"status": "connect_failed", "detail": str(exc)}
+    except Exception as exc:
+        log("warn", f"debug-mcp failed for {crm}: {exc}")
+        return {"status": "error", "crm": crm, "detail": str(exc)}
 
 
 # =============================================================================
@@ -782,7 +442,8 @@ async def oauth_callback(
         log("ok", "HubSpot tokens exchanged")
     except ValueError as exc:
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={exc}&crm=hubspot")
-    await _pool.invalidate("hubspot")
+    mcp_manager.remove("hubspot")
+    _register_hubspot()  # re-register with fresh token
     deindex_agent_tools("hubspot")  # scopes may have changed -> re-index on next connect
     return RedirectResponse(f"{STREAMLIT_URL}?oauth_ok=hubspot")
 
@@ -791,7 +452,7 @@ async def oauth_callback(
 async def api_disconnect():
     if HS_TOKEN_FILE.exists():
         HS_TOKEN_FILE.unlink()
-    await _pool.invalidate("hubspot")
+    mcp_manager.remove("hubspot")
     deindex_agent_tools("hubspot")
     await evict_all_sessions()
     log("bye", "HubSpot disconnected")
@@ -809,11 +470,16 @@ async def zoho_people_save_url(request: Request):
     if not url:
         return JSONResponse({"error": "url required"}, status_code=400)
     zp_save_mcp_url(url)
-    await _pool.invalidate("zoho_people")
+    mcp_manager.remove("zoho_people")
+    _register_zoho_people()  # re-register with new URL
     deindex_agent_tools("zoho_people")  # URL changed -> force re-index on next connect
     log("info", f"Zoho People MCP URL saved -> {url[:60]}")
-    client = MCPClient(url=url, headers={})
-    ok, msg = await client.preflight()
+    # Quick reachability check via a lightweight tool list
+    try:
+        tools = await mcp_manager.get_tools(["zoho_people"])
+        ok, msg = True, f"{len(tools)} tools available"
+    except Exception as exc:
+        ok, msg = False, str(exc)
     log("ok" if ok else "warn", f"Zoho People reachable={ok}: {msg}")
     return {"saved": True, "reachable": ok, "detail": msg}
 
@@ -822,7 +488,7 @@ async def zoho_people_save_url(request: Request):
 async def zoho_people_disconnect():
     zp_disconnect_auth()
     zp_disconnect_oauth()
-    await _pool.invalidate("zoho_people")
+    mcp_manager.remove("zoho_people")
     deindex_agent_tools("zoho_people")
     await evict_all_sessions()
     log("bye", "Zoho People fully disconnected (MCP + OAuth)")
@@ -865,6 +531,7 @@ async def zoho_people_oauth_callback(
         return RedirectResponse(f"{STREAMLIT_URL}?oauth_error={exc}&crm=zoho_people")
     # Clear disconnect sentinel so MCP URL from .env loads again
     zp_reconnect_auth()
+    _register_zoho_people()  # re-register with updated OAuth token
     # Clear tool caches so the synthetic callAPI tool gets injected on next request
     deindex_agent_tools("zoho_people")
     await evict_all_sessions()
@@ -880,6 +547,24 @@ async def zoho_people_disconnect_oauth():
     log("bye", "Zoho People OAuth disconnected (MCP still active)")
     return {"disconnected": True}
 
+
+
+
+# =============================================================================
+# Response Quality
+# =============================================================================
+
+_last_scores: dict[str, dict] = {}  # session_id -> scores
+
+
+def _store_grade_scores(session_id: str, scores: dict):
+    """Called by grader after scoring (stored for UI badge retrieval)."""
+    _last_scores[session_id] = scores
+
+
+@app.get("/api/response-quality/{session_id}")
+async def response_quality(session_id: str):
+    return _last_scores.get(session_id, {})
 
 if __name__ == "__main__":
     uvicorn.run("web_app:app", host="0.0.0.0", port=8000, reload=False)

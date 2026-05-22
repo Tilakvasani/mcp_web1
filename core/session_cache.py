@@ -8,8 +8,7 @@ TTL = 10 minutes. Stale or disconnected clients evict automatically.
 
 Key design:
   - Tool closures capture a *client_resolver* callable, not the client
-    directly. This means tools survive MCPClient.reconnect() and even
-    full pool eviction + recreation.
+    directly. This was used by the old MCPClient pool. Now kept for context only.
 
 Structure:
   _CACHE[session_id][agent_key] = SessionEntry(tools, loaded_at)
@@ -18,8 +17,7 @@ Structure:
 from __future__ import annotations
 import time
 import asyncio
-import json
-from typing import Any, Optional, Callable
+from typing import Optional, Callable
 from dataclasses import dataclass, field
 
 from pydantic import create_model, Field
@@ -54,8 +52,8 @@ _TOOL_SCHEMAS: dict[str, list] = {}
 async def get_or_load_tools(
     session_id      : str,
     agent_key       : str,
-    client,                          # MCPClient (used only for list_tools)
-    client_resolver : Callable = None,  # () -> MCPClient  (used by tool closures)
+    client,                          # MCPManager instance
+    client_resolver : Callable = None,  # kept for API compat, unused
 ) -> list:
     async with _LOCK:
         session = _CACHE.setdefault(session_id, {})
@@ -67,24 +65,17 @@ async def get_or_load_tools(
 
     log("cache", f"tool cache MISS session={session_id[:8]} agent={agent_key} -- loading...")
 
-    # Use global schema cache if available (skip MCP round-trip)
-    raw_tools = _TOOL_SCHEMAS.get(agent_key)
-    schema_cached = False
-    if raw_tools:
-        log("cache", f"tool schema cache HIT for {agent_key} ({len(raw_tools)} schemas)")
-        schema_cached = True
-    else:
-        try:
-            raw_tools = await client.list_tools()
-            _TOOL_SCHEMAS[agent_key] = raw_tools
-            log("cache", f"tool schema cache STORE for {agent_key} ({len(raw_tools)} schemas)")
-        except Exception as e:
-            log("error", f"list_tools failed for {agent_key}: {e}")
-            return []
-
-    # If no resolver provided, fall back to direct client reference
-    resolver = client_resolver or (lambda: client)
-    lc_tools = _to_langchain_tools(raw_tools, resolver, verbose=not schema_cached)
+    # Load tools via MCPManager (LangChain MCP adapters — reconnects per call)
+    # _TOOL_SCHEMAS is now keyed by tool name for schema dedup logging
+    try:
+        lc_tools = await client.get_tools([agent_key])
+        # Update schema cache with tool names for stats/logging
+        tool_names = [getattr(t, "name", "") for t in lc_tools]
+        _TOOL_SCHEMAS[agent_key] = tool_names
+        log("cache", f"tool schema cache STORE for {agent_key} ({len(lc_tools)} tools)")
+    except Exception as e:
+        log("error", f"get_tools failed for {agent_key}: {e}")
+        return []
 
     # Inject synthetic tools for agents with limited MCP tool sets
     synthetic = _build_synthetic_tools(agent_key)
@@ -138,133 +129,6 @@ def get_cache_stats() -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# JSON Schema -> Pydantic model (no MCPClient in schema)
-# ---------------------------------------------------------------------------
-
-def _json_type_to_python(prop: dict) -> type:
-    type_str = prop.get("type", "string")
-    if isinstance(type_str, list):
-        non_null = [t for t in type_str if t != "null"]
-        type_str = non_null[0] if non_null else "string"
-    return {
-        "string" : str,
-        "integer": int,
-        "number" : float,
-        "boolean": bool,
-        "array"  : list,
-        "object" : dict,
-    }.get(type_str, Any)
-
-
-def _build_args_schema(schema: dict, tool_name: str):
-    """
-    Build a proper Pydantic model from the MCP tool's inputSchema.
-    This gives the LLM a real parameter spec so it knows exactly what to send.
-    No MCPClient reference in this model.
-    """
-    properties = schema.get("properties", {})
-    required   = set(schema.get("required", []))
-    fields: dict[str, tuple] = {}
-
-    for param_name, prop in properties.items():
-        py_type     = _json_type_to_python(prop)
-        description = prop.get("description", "")
-        enum_vals   = prop.get("enum")
-
-        # Enrich description with allowed values if present
-        if enum_vals:
-            description = f"{description} Allowed values: {', '.join(str(v) for v in enum_vals)}"
-
-        if param_name in required:
-            fields[param_name] = (py_type, Field(..., description=description))
-        else:
-            fields[param_name] = (Optional[py_type], Field(default=None, description=description))
-
-    # Fallback: at least one field so the model is valid
-    if not fields:
-        fields["input"] = (Optional[str], Field(default=None, description="Tool input"))
-
-    safe_name = tool_name.replace("-", "_").replace(".", "_")
-    return create_model(f"{safe_name}_Args", **fields)
-
-
-# ---------------------------------------------------------------------------
-# LangChain tool wrapper
-# ---------------------------------------------------------------------------
-
-def _make_tool_fn(client_resolver: Callable, tool_name: str):
-    """
-    Return an async callable that calls client.call_tool(tool_name, kwargs).
-
-    IMPORTANT: client_resolver is a callable that returns the *current*
-    MCPClient at call-time.  This means the tool keeps working even after
-    MCPClient.reconnect() creates a new transport, or after the pool
-    evicts and recreates the client entirely.
-    """
-    async def _call(**kwargs) -> str:
-        # Strip None values so MCP server doesn't complain about missing fields
-        clean = {k: v for k, v in kwargs.items() if v is not None and k != "input"}
-        try:
-            client = client_resolver()
-            result = await client.call_tool(tool_name, clean)
-            if result is None:
-                return "No result returned."
-
-            content = getattr(result, "content", result)
-            if isinstance(content, list):
-                parts = []
-                for c in content:
-                    text = getattr(c, "text", None)
-                    if text:
-                        parts.append(text)
-                    elif isinstance(c, dict):
-                        parts.append(json.dumps(c))
-                return "\n".join(parts) if parts else str(content)
-            return str(content)
-
-        except Exception as e:
-            return f"Tool error ({tool_name}): {e}"
-
-    return _call
-
-
-def _to_langchain_tools(mcp_tools: list, client_resolver: Callable, verbose: bool = True) -> list:
-    """
-    Wrap raw MCP tool definitions as LangChain StructuredTools.
-
-    Key design choices:
-    - client_resolver is called at tool invocation time (not wrapping time)
-    - args_schema is built from inputSchema -> LLM gets real param spec
-    - verbose=False suppresses per-tool logs (used on schema cache HIT)
-    """
-    lc_tools = []
-    for tool in mcp_tools:
-        name   = getattr(tool, "name",        "") or ""
-        desc   = getattr(tool, "description", "") or ""
-        schema = getattr(tool, "inputSchema", {}) or {}
-
-        if not name:
-            continue
-
-        try:
-            args_schema = _build_args_schema(schema, name)
-            call_fn     = _make_tool_fn(client_resolver, name)
-
-            lc_tool = StructuredTool(
-                name        = name,
-                description = desc,
-                args_schema = args_schema,
-                coroutine   = call_fn,
-            )
-            lc_tools.append(lc_tool)
-            if verbose:
-                log("tool", f"wrapped: {name} ({len(schema.get('properties', {}))} params)")
-
-        except Exception as e:
-            log("warn", f"could not wrap tool {name}: {e}")
-
-    return lc_tools
 
 
 # ---------------------------------------------------------------------------
